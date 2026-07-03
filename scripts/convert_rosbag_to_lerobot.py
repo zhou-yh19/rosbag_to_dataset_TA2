@@ -19,7 +19,7 @@ Usage:
     Process multiple rosbag files:
     ```bash
     rm -rf ~/.cache/huggingface/lerobot/username/dataset_name
-    python scripts/convert_rosbag_with_markers.py \
+    python scripts/convert_rosbag_to_lerobot.py \
         --multibag \
         --input_directory ./data/rosbags \
         --output username/dataset_name \
@@ -30,7 +30,7 @@ Usage:
     Process a single rosbag file:
     ```bash
     rm -rf ~/.cache/huggingface/lerobot/username/dataset_name
-    python scripts/convert_rosbag_with_markers.py \
+    python scripts/convert_rosbag_to_lerobot.py \
         --input_directory ./data/rosbags \
         --output username/dataset_name \
         --fps 30 \
@@ -40,7 +40,7 @@ Usage:
     Enforce requirement for all four video topics:
     ```bash
     rm -rf ~/.cache/huggingface/lerobot/username/dataset_name
-    python scripts/convert_rosbag_with_markers.py \
+    python scripts/convert_rosbag_to_lerobot.py \
         --multibag \
         --enforce_four_video_topics \
         --input_directory ./data/rosbags \
@@ -104,6 +104,7 @@ class MultiVideoRosBag2LeRobotConverter:
             'left_color':  '/left/color/image_raw/ffmpeg',
             'right_color': '/right/color/image_raw/ffmpeg',
             'head_camera': '/xr_video_topic/ffmpeg',
+            'chest_camera':'/head/color/image_raw/ffmpeg',
         }
         # Video topics set
         self.video_topics_set = set(self.video_topics.values())
@@ -164,26 +165,40 @@ class MultiVideoRosBag2LeRobotConverter:
                     dirnames.clear()
 
             if rosbag_folders:
-                # Find .db3 or .mcap files in rosbag directory
-                for rosbag_dir in rosbag_folders:
+                # One entry per bag directory: the reader opens the directory and
+                # replays every storage file listed in metadata.yaml, so split bags
+                # (multiple .db3/.mcap segments) must not be enumerated per file
+                for rosbag_dir in sorted(rosbag_folders):
                     rosbag_dir = Path(rosbag_dir)
-                    db3_files = list(rosbag_dir.glob("*.db3")) or list(rosbag_dir.glob("*.mcap"))
+                    db3_files = sorted(rosbag_dir.glob("*.db3"))
+                    mcap_files = sorted(rosbag_dir.glob("*.mcap"))
+                    if db3_files and mcap_files:
+                        self.logger.warning(
+                            f"{rosbag_dir} contains both .db3 and .mcap files; "
+                            f"using .db3 and ignoring .mcap")
+                    db3_files = db3_files or mcap_files
                     if db3_files:
-                        for db3_file in db3_files:
-                            rosbags.append({
-                                'name': rosbag_dir.name,
-                                'path': str(rosbag_dir),
-                                'bag_file': str(db3_file),
-                            })
+                        rosbags.append({
+                            'name': rosbag_dir.name,
+                            'path': str(rosbag_dir),
+                            'bag_file': str(db3_files[0]),
+                        })
 
         else:
-            # one rosbag
-            db3_files = list(self.input_directory.glob("*.db3")) or list(self.input_directory.glob("*.mcap"))
-            for i, db3_file in enumerate(sorted(db3_files)):
+            # one rosbag: the directory holds a single bag (one metadata.yaml),
+            # possibly split into several storage files
+            db3_files = sorted(self.input_directory.glob("*.db3"))
+            mcap_files = sorted(self.input_directory.glob("*.mcap"))
+            if db3_files and mcap_files:
+                self.logger.warning(
+                    f"{self.input_directory} contains both .db3 and .mcap files; "
+                    f"using .db3 and ignoring .mcap")
+            db3_files = db3_files or mcap_files
+            if db3_files:
                 rosbags.append({
-                    'name': f"episode_{i:03d}",
-                    'path': str(db3_file.parent),
-                    'bag_file': str(db3_file)
+                    'name': "episode_000",
+                    'path': str(db3_files[0].parent),
+                    'bag_file': str(db3_files[0])
                 })
 
         self.logger.info(f"Discovered {len(rosbags)} bags:")
@@ -508,7 +523,7 @@ class MultiVideoRosBag2LeRobotConverter:
 
                                 self.dataset.episode_buffer = self.dataset.create_episode_buffer()
                                 packet_buffer = VideoPacketBuffer(root_dir=self.dataset.root, fps=self.dataset.fps)
-
+                                
                             elif (previous_buttons[x_button] == 0 and buttons[x_button] == 1 and is_recording):
                                 is_recording = True
                                 start_time = timestamp
@@ -728,7 +743,7 @@ def main():
                         help="Task description")
     parser.add_argument("--log_file",
                         default=None,
-                        help="Log file path (default: convert_rosbag_with_markers_YYYYMMDD_HHMMSS.log in script directory)")
+                        help="Log file path (default: convert_rosbag_to_lerobot_YYYYMMDD_HHMMSS.log in script directory)")
     args = parser.parse_args()
 
     # Set log file path
@@ -737,7 +752,7 @@ def main():
         logs_dir = script_dir / "logs"
         logs_dir.mkdir(exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file_path = logs_dir / f"convert_rosbag_with_markers_{timestamp}.log"
+        log_file_path = logs_dir / f"convert_rosbag_to_lerobot_{timestamp}.log"
     else:
         log_file_path = Path(args.log_file)
 
