@@ -100,7 +100,7 @@ All converters accept both rosbag2 storage formats and pick the storage plugin a
 | Group | Topics |
 |---|---|
 | Markers | `/xr/left_hand_inputs` (`sensor_msgs/Joy`) |
-| Video (HEVC `FFMPEGPacket`) | `/left/color/image_raw/ffmpeg`, `/right/color/image_raw/ffmpeg`, `/xr_video_topic/ffmpeg` (head), `/head/color/image_raw/ffmpeg` (chest, HDF5 only) |
+| Video (HEVC `FFMPEGPacket`) | `/left/color/image_raw/ffmpeg`, `/right/color/image_raw/ffmpeg`, `/xr_video_topic/ffmpeg` (head) |
 | Camera info | `/left/color/camera_info`, `/right/color/camera_info`, `/head/color/camera_info` |
 | State (62 dims) | `/left_arm/joint_states`, `/right_arm/joint_states`, `/left_gripper/joint_states`, `/right_gripper/joint_states`, `/left_arm/current_ee_pose`, `/right_arm/current_ee_pose` |
 | Action (62 dims) | `/left_arm/joint_cmd`, `/right_arm/joint_cmd`, `/left_gripper/joint_cmd`, `/right_gripper/joint_cmd`, `/left_arm/target_ee_pose`, `/right_arm/target_ee_pose` |
@@ -138,7 +138,7 @@ python scripts/convert_rosbag_to_lerobot.py \
 - `--fps`: Target frame rate (default: 30)
 - `--task`: Task description
 - `--multibag`: (Optional) Use if the directory contains multiple rosbag folders
-- `--enforce_four_video_topics`: (Optional) Skip bags missing any of the four video topics
+- `--enforce_all_video_topics`: (Optional) Skip bags missing any of the three video topics
 - `--log_file`: (Optional) Log file path (default: `scripts/logs/convert_rosbag_to_lerobot_<timestamp>.log`)
 
 ### Scenario 2: Convert to HDF5 Format
@@ -164,8 +164,7 @@ episode_XXXXXX.hdf5
     │   └── images/
     │       ├── left_color         (N,)    vlen uint8 — JPEG bytes per frame
     │       ├── right_color        (N,)    vlen uint8
-    │       ├── head_camera        (N,)    vlen uint8
-    │       └── chest_camera       (N,)    vlen uint8
+    │       └── head_camera        (N,)    vlen uint8
     ├── action                     (N, 62) float32  (attrs: names)
     └── chassis_action             (N, 9)  float32  (attrs: names)
 ```
@@ -188,7 +187,7 @@ python scripts/convert_rosbag_to_hdf5.py \
 - `--fps`: Target frame rate (default: 30)
 - `--task`: Task description
 - `--multibag`: (Optional) Use if the directory contains multiple rosbag folders
-- `--enforce_four_video_topics`: (Optional) Skip bags missing any of the four video topics
+- `--enforce_all_video_topics`: (Optional) Skip bags missing any of the three video topics
 - `--start_episode_idx`: Starting index for output episode numbering (default: 0). Use this to append to an output directory that already contains episodes.
 - `--overwrite`: Allow replacing existing `episode_*.hdf5` files. Without it, the script refuses to start if new episode indices would collide with existing files.
 - `--jpeg_quality`: JPEG encode quality 1–100 (default: 85)

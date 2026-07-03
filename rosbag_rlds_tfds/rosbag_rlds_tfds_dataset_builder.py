@@ -214,7 +214,7 @@ def _parse_example(
         collector.convert_single_bag(
             rosbag=rosbag,
             task_description=task_description,
-            ENFORCE_FOUR_VIDEO_TOPICS_FLAG=enforce_video_topics,
+            ENFORCE_ALL_VIDEO_TOPICS_FLAG=enforce_video_topics,
         )
 
         for episode_index, episode_example in collector.iter_spooled_episodes():

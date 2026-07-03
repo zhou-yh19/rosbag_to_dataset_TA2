@@ -816,7 +816,7 @@ class MultiVideoRosBag2RLDSConverter:
         self.logger.info(f'Saved episode {episode_index} with {n_steps} frames ({n_steps / self.fps:.1f}s)')
         return True
 
-    def convert_single_bag(self, rosbag, task_description: str, ENFORCE_FOUR_VIDEO_TOPICS_FLAG: bool):
+    def convert_single_bag(self, rosbag, task_description: str, ENFORCE_ALL_VIDEO_TOPICS_FLAG: bool):
         self.logger.info(f"\n=== Processing {rosbag['name']} ===")
 
         bag_path = Path(rosbag['path'])
@@ -844,7 +844,7 @@ class MultiVideoRosBag2RLDSConverter:
             if topic_metadata.name in self.all_topics_set:
                 self.topic_types_dict[topic_metadata.name] = topic_metadata.type
 
-        if ENFORCE_FOUR_VIDEO_TOPICS_FLAG is True:
+        if ENFORCE_ALL_VIDEO_TOPICS_FLAG is True:
             for video_topic_name in self.video_topics_set:
                 if video_topic_name not in self.topic_types_dict:
                     self.logger.warning(
@@ -1039,7 +1039,7 @@ class MultiVideoRosBag2RLDSConverter:
         self._clear_episode_frames(episode_frames)
         del reader
 
-    def convert_all(self, task_description: str, MULTIBAG_FLAG: bool, ENFORCE_FOUR_VIDEO_TOPICS_FLAG: bool):
+    def convert_all(self, task_description: str, MULTIBAG_FLAG: bool, ENFORCE_ALL_VIDEO_TOPICS_FLAG: bool):
         self.logger.info(f"Starting multi-bag conversion: {self.input_directory}")
         _convert_start = time.time()
 
@@ -1051,7 +1051,7 @@ class MultiVideoRosBag2RLDSConverter:
 
         processed_rosbags = 0
         for rosbag in rosbags:
-            self.convert_single_bag(rosbag, task_description, ENFORCE_FOUR_VIDEO_TOPICS_FLAG)
+            self.convert_single_bag(rosbag, task_description, ENFORCE_ALL_VIDEO_TOPICS_FLAG)
             processed_rosbags += 1
             self.logger.info(f"[{processed_rosbags}/{total_rosbags}] Finished processing rosbag: {rosbag.get('name')}")
 
@@ -1131,7 +1131,7 @@ def main():
     parser = argparse.ArgumentParser(description='Convert multiple ROS2 bags to RLDS-like TFRecord dataset')
     parser.add_argument('--multibag', action='store_true',
                         help='Whether input_directory contains multiple rosbags, pass True if yes, False if no')
-    parser.add_argument('--enforce_four_video_topics', action='store_true',
+    parser.add_argument('--enforce_all_video_topics', action='store_true',
                         help='Enforce that rosbag must have all configured video topics')
     parser.add_argument('--input_directory', default='./data/rosbags',
                         help='Directory containing ROS2 bag segments')
@@ -1160,7 +1160,7 @@ def main():
             sys.exit(1)
 
         converter = MultiVideoRosBag2RLDSConverter(args.input_directory, args.output_directory, args.fps)
-        converter.convert_all(args.task, args.multibag, args.enforce_four_video_topics)
+        converter.convert_all(args.task, args.multibag, args.enforce_all_video_topics)
     finally:
         sys.stdout.flush()
         sys.stderr.flush()

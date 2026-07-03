@@ -16,8 +16,7 @@ The HDF5 output structure for each episode file is:
     ├── /meta (attrs: task, fps, episode_idx, n_frames, source_bag, recording_time)
     │   └── /cameras
     │       ├── left_color  (attrs: K, D, P, width, height, distortion_model)
-    │       ├── right_color (attrs: K, D, P, width, height, distortion_model)
-    │       └── chest_camera (attrs: K, D, P, width, height, distortion_model)
+    │       └── right_color (attrs: K, D, P, width, height, distortion_model)
     └── /data
         ├── timestamp                        (N,)    float64
         ├── observation/
@@ -26,8 +25,7 @@ The HDF5 output structure for each episode file is:
         │   └── images/
         │       ├── left_color               (N,) vlen uint8  ← JPEG bytes per frame
         │       ├── right_color              (N,) vlen uint8
-        │       ├── head_camera              (N,) vlen uint8
-        │       └── chest_camera             (N,) vlen uint8
+        │       └── head_camera              (N,) vlen uint8
         ├── action                           (N, 62) float32  (attrs: names)
         └── chassis_action                   (N, 9)  float32  (attrs: names)
 
@@ -136,7 +134,6 @@ class MultiVideoRosBag2HDF5Converter:
             'left_color':  '/left/color/image_raw/ffmpeg',
             'right_color': '/right/color/image_raw/ffmpeg',
             'head_camera': '/xr_video_topic/ffmpeg',
-            'chest_camera': '/head/color/image_raw/ffmpeg',
         }
         # Video topics set
         self.video_topics_set = set(self.video_topics.values())
@@ -145,7 +142,6 @@ class MultiVideoRosBag2HDF5Converter:
         self.camera_info_topics = {
             'left_color':  '/left/color/camera_info',
             'right_color': '/right/color/camera_info',
-            'chest_camera': '/head/color/camera_info',
         }
         # Cache for camera intrinsics, populated once per bag before main loop
         self._camera_info_cache: dict = {}
@@ -920,7 +916,7 @@ class MultiVideoRosBag2HDF5Converter:
         frame_data['action'] = self._cur_action_msg.copy()
         frame_data['chassis_action'] = self._cur_chassis_action_msg.copy()
 
-    def convert_single_bag(self, rosbag, task_description: str, ENFORCE_FOUR_VIDEO_TOPICS_FLAG: bool):
+    def convert_single_bag(self, rosbag, task_description: str, ENFORCE_ALL_VIDEO_TOPICS_FLAG: bool):
         """Convert a single bag to one or multiple episodes in the dataset."""
         self.logger.info(f"\n=== Processing {rosbag['name']} ===")
 
@@ -952,7 +948,7 @@ class MultiVideoRosBag2HDF5Converter:
             if topic_metadata.name in self.all_topics_set:
                 self.topic_types_dict[topic_metadata.name] = topic_metadata.type
 
-        if ENFORCE_FOUR_VIDEO_TOPICS_FLAG is True:
+        if ENFORCE_ALL_VIDEO_TOPICS_FLAG is True:
             for video_topic_name in self.video_topics_set:
                 if video_topic_name not in self.topic_types_dict:
                     self.logger.warning(
@@ -1132,7 +1128,7 @@ class MultiVideoRosBag2HDF5Converter:
         del reader
 
 
-    def convert_all(self, task_description: str, MULTIBAG_FLAG: bool, ENFORCE_FOUR_VIDEO_TOPICS_FLAG: bool):
+    def convert_all(self, task_description: str, MULTIBAG_FLAG: bool, ENFORCE_ALL_VIDEO_TOPICS_FLAG: bool):
         """Convert all discovered rosbags to a multi-episode HDF5 dataset."""
         self.logger.info(f"Starting multi-bag conversion: {self.input_directory}")
         _convert_start = time.time()
@@ -1171,7 +1167,7 @@ class MultiVideoRosBag2HDF5Converter:
         # Convert each rosbag
         processed_rosbags = 0
         for rosbag in rosbags:
-            self.convert_single_bag(rosbag, task_description, ENFORCE_FOUR_VIDEO_TOPICS_FLAG)
+            self.convert_single_bag(rosbag, task_description, ENFORCE_ALL_VIDEO_TOPICS_FLAG)
             processed_rosbags += 1
             self.logger.info(f"[{processed_rosbags}/{total_rosbags}] Finished processing rosbag: {rosbag.get('name')}")
 
@@ -1268,9 +1264,9 @@ def main():
     parser.add_argument("--multibag",
                         action="store_true", # If not in command, defaults to false
                         help="Whether input_directory contains multiple rosbags, pass True if yes, False if no")
-    parser.add_argument("--enforce_four_video_topics",
+    parser.add_argument("--enforce_all_video_topics",
                         action="store_true",
-                        help="Enforce that rosbag must have four video topics, if you don't want to enforce this, you can comment out unwanted topics in self.video_topics")
+                        help="Enforce that rosbag must have all video topics, if you don't want to enforce this, you can comment out unwanted topics in self.video_topics")
     parser.add_argument("--input_directory",
                         default="./data/rosbags",
                         help="Directory containing ROS2 bag segments")
@@ -1327,7 +1323,7 @@ def main():
             args.jpeg_workers,
             overwrite=args.overwrite,
         )
-        success = converter.convert_all(args.task, args.multibag, args.enforce_four_video_topics)
+        success = converter.convert_all(args.task, args.multibag, args.enforce_all_video_topics)
         if not success:
             sys.exit(1)
     finally:

@@ -37,12 +37,12 @@ Usage:
         --task "task description"
     ```
 
-    Enforce requirement for all four video topics:
+    Enforce requirement for all video topics:
     ```bash
     rm -rf ~/.cache/huggingface/lerobot/username/dataset_name
     python scripts/convert_rosbag_to_lerobot.py \
         --multibag \
-        --enforce_four_video_topics \
+        --enforce_all_video_topics \
         --input_directory ./data/rosbags \
         --output username/dataset_name \
         --task "task description"
@@ -99,12 +99,11 @@ class MultiVideoRosBag2LeRobotConverter:
             logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
 
-        # Video topics mapping - all 7 cameras from your robot
+        # Video topics mapping
         self.video_topics = {
             'left_color':  '/left/color/image_raw/ffmpeg',
             'right_color': '/right/color/image_raw/ffmpeg',
             'head_camera': '/xr_video_topic/ffmpeg',
-            'chest_camera':'/head/color/image_raw/ffmpeg',
         }
         # Video topics set
         self.video_topics_set = set(self.video_topics.values())
@@ -452,7 +451,7 @@ class MultiVideoRosBag2LeRobotConverter:
         self.logger.info(f"⏹️ Realigned timestamps for {episode_length} frames, timestamp range: {aligned_timestamps[0]:.6f} to {aligned_timestamps[-1]:.6f} seconds")
 
 
-    def convert_single_bag(self, rosbag, task_description: str, ENFORCE_FOUR_VIDEO_TOPICS_FLAG: bool):
+    def convert_single_bag(self, rosbag, task_description: str, ENFORCE_ALL_VIDEO_TOPICS_FLAG: bool):
         """Convert a single bag to one or multiple episodes in the dataset."""
         self.logger.info(f"\n=== Processing {rosbag['name']} ===")
 
@@ -478,7 +477,7 @@ class MultiVideoRosBag2LeRobotConverter:
             if topic_metadata.name in self.all_topics_set:
                 self.topic_types_dict[topic_metadata.name] = topic_metadata.type
 
-        if ENFORCE_FOUR_VIDEO_TOPICS_FLAG is True:
+        if ENFORCE_ALL_VIDEO_TOPICS_FLAG is True:
             for video_topic_name in self.video_topics_set:
                 if video_topic_name not in self.topic_types_dict:
                     del reader
@@ -648,7 +647,7 @@ class MultiVideoRosBag2LeRobotConverter:
         shutil.rmtree(self.dataset.root/'images', ignore_errors=True)
 
 
-    def convert_all(self, task_description: str, MULTIBAG_FLAG: bool, ENFORCE_FOUR_VIDEO_TOPICS_FLAG: bool):
+    def convert_all(self, task_description: str, MULTIBAG_FLAG: bool, ENFORCE_ALL_VIDEO_TOPICS_FLAG: bool):
         """Convert all discovered rosbags to a multi-episode dataset."""
         self.logger.info(f"Starting multi-bag conversion: {self.input_directory}")
 
@@ -665,7 +664,7 @@ class MultiVideoRosBag2LeRobotConverter:
         # Convert each rosbag
         processed_rosbags = 0
         for rosbag in rosbags:
-            self.convert_single_bag(rosbag, task_description, ENFORCE_FOUR_VIDEO_TOPICS_FLAG)
+            self.convert_single_bag(rosbag, task_description, ENFORCE_ALL_VIDEO_TOPICS_FLAG)
             processed_rosbags += 1
             self.logger.info(f"[{processed_rosbags}/{total_rosbags}] Finished processing rosbag: {rosbag.get('name')}")
 
@@ -726,9 +725,9 @@ def main():
     parser.add_argument("--multibag",
                         action="store_true", # If not in command, defaults to false
                         help="Whether input_directory contains multiple rosbags, pass True if yes, False if no")
-    parser.add_argument("--enforce_four_video_topics",
+    parser.add_argument("--enforce_all_video_topics",
                         action="store_true", # If not in command, defaults to false
-                        help="Enforce that rosbag must have four video topics, if you don't want to enforce this, you can comment out unwanted topics in self.video_topics")
+                        help="Enforce that rosbag must have all video topics, if you don't want to enforce this, you can comment out unwanted topics in self.video_topics")
     parser.add_argument("--input_directory",
                         default="./data/rosbags",
                         help="Directory containing ROS2 bag segments")
@@ -765,7 +764,7 @@ def main():
             sys.exit(1)
 
         converter = MultiVideoRosBag2LeRobotConverter(args.input_directory, args.output, args.fps)
-        converter.convert_all(args.task, args.multibag, args.enforce_four_video_topics)
+        converter.convert_all(args.task, args.multibag, args.enforce_all_video_topics)
     finally:
         # Restore original stdout and stderr
         sys.stdout.flush()
