@@ -126,10 +126,11 @@ class MultiVideoRosBag2RLDSConverter:
         # Video topics set
         self.video_topics_set = set(self.video_topics.values())
         # Camera info topics mapping (camera_key -> camera_info topic)
+        # head_camera (/xr_video_topic/ffmpeg) has no dedicated camera_info in
+        # recorded bags; its cameras metadata is stored with found=False.
         self.camera_info_topics = {
             'left_color': '/left/color/camera_info',
             'right_color': '/right/color/camera_info',
-            'head_camera': '/head/color/camera_info',
         }
         self.camera_info_topics_set = set(self.camera_info_topics.values())
         # Cache for camera intrinsics, populated once per bag before main loop
