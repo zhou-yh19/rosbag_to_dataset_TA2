@@ -4,19 +4,31 @@
 # See LICENSE file in the project root for full license information.
 # Configure environment variables for rosbag_rlds_tfds dataset building.
 #
-# Usage:
+# Usage (bash or zsh):
 #   source rosbag_rlds_tfds/setup_rosbag_rlds_env.sh
 #
 # Either edit the defaults in the config block below, or export any ROSBAG_* /
 # TFDS_DATA_DIR variable before sourcing — pre-exported values are preserved.
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-  echo "Please source this script instead of executing it:"
-  echo "  source rosbag_rlds_tfds/setup_rosbag_rlds_env.sh"
-  exit 1
+# Resolve this script's path in both zsh and bash (zsh has no BASH_SOURCE).
+if [ -n "${ZSH_VERSION:-}" ]; then
+  case "${ZSH_EVAL_CONTEXT:-}" in
+    *:file*) ;;
+    *) echo "Please source this script instead of executing it:"
+       echo "  source rosbag_rlds_tfds/setup_rosbag_rlds_env.sh"
+       exit 1;;
+  esac
+  eval '_SCRIPT_PATH="${(%):-%x}"'
+else
+  if [ "${BASH_SOURCE[0]:-}" = "$0" ]; then
+    echo "Please source this script instead of executing it:"
+    echo "  source rosbag_rlds_tfds/setup_rosbag_rlds_env.sh"
+    exit 1
+  fi
+  _SCRIPT_PATH="${BASH_SOURCE[0]}"
 fi
 
-_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_SCRIPT_DIR="$(cd "$(dirname "${_SCRIPT_PATH}")" && pwd)"
 _REPO_ROOT="$(cd "${_SCRIPT_DIR}/.." && pwd)"
 
 # =========================
