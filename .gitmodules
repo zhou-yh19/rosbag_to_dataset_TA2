@@ -1,4 +1,4 @@
 [submodule "lerobot"]
 	path = lerobot
 	url = git@github.com:zhou-yh19/lerobot.git
-	branch = dev
+	branch = rosbag_to_lerobot
