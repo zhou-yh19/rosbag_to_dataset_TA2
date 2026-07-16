@@ -13,7 +13,7 @@ A toolkit for converting ROS2 bag files (`.db3` / `.mcap`) into LeRobot v2.1 dat
 
 - [System Requirements](#-system-requirements)
 - [Quick Start](#-quick-start)
-  - [1. Install Conda](#1-install-conda)
+  - [1. Install Miniforge](#1-install-miniforge)
   - [2. Create Conda Environment](#2-create-conda-environment)
   - [3. Install Project-Specific LeRobot](#3-install-project-specific-lerobot)
 - [Input Bag Format (db3 / mcap)](#-input-bag-format-db3--mcap)
@@ -42,18 +42,18 @@ A toolkit for converting ROS2 bag files (`.db3` / `.mcap`) into LeRobot v2.1 dat
 - **GPU**: NVIDIA GPU with NVDEC/NVENC strongly recommended — the LeRobot converter re-encodes all episode videos and is GPU-accelerated (an automatic CPU fallback exists but is far slower)
 - **LeRobot Version**: 0.3.3 (Modified)
 - **Dataset Format**: v2.1
-- **Conda/Anaconda**: For environment management
+- **Package manager**: [Miniforge](https://github.com/conda-forge/miniforge) (conda/mamba, conda-forge channel)
 
 ## 🚀 Quick Start
 
-### 1. Install Conda
+### 1. Install Miniforge
 
-Download and install Miniconda or Anaconda:
+We recommend [Miniforge](https://github.com/conda-forge/miniforge), which ships `conda`/`mamba` with conda-forge as the default channel. `environment.yml` installs from `conda-forge` and `robostack-staging` only.
 
 ```bash
-# Install Anaconda (replace with your actual installer name)
-chmod +x Anaconda3-2025.06-0-Linux-x86_64.sh
-./Anaconda3-2025.06-0-Linux-x86_64.sh
+# Download and install Miniforge (Linux x86_64)
+wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
+bash Miniforge3-Linux-x86_64.sh
 ```
 
 After installation, open a new terminal. You should see `(base)` before your username.
