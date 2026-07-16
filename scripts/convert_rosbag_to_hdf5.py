@@ -8,8 +8,13 @@ Convert ROS2 bag files with X/Y episode markers to HDF5 format.
 
 This script processes rosbag files that contain multiple episodes marked by operator
 button presses (X button to start, Y button to end recording).
-Video packets are decoded from HEVC to BGR frames with PyAV, then re-encoded
-to per-timestep JPEG bytes and stored in HDF5 (RobotWin style).
+
+The robot's camera streams are H.265 with inter-coded GOPs. Raw packets are
+buffered per episode (starting at the last IDR keyframe before the X press so
+the whole GOP chain is decodable), then decoded in one ffmpeg pass per camera
+— NVDEC GPU-accelerated when available, software decode otherwise. Frames are
+sampled on the episode's fps grid (frame for row k = latest camera frame at
+row k's sampling instant), JPEG-encoded, and stored in HDF5 (RobotWin style).
 
 The HDF5 output structure for each episode file is:
     episode_XXXXXX.hdf5
@@ -73,15 +78,23 @@ import argparse
 from pathlib import Path
 import logging
 import traceback
+from collections import deque
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 import h5py
 import cv2
+
+# Shared packet-buffering / GPU frame-extraction machinery (same directory)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
-    import av
+    from rosbag_video_extraction import (
+        detect_gpu_count,
+        extract_grid_frames,
+        packets_from_last_idr,
+    )
 except ImportError as e:
-    print(f"PyAV dependency not found: {e}. Please install with `pip install av` in rosbag2lerobot env.")
+    print(f"rosbag_video_extraction module not found next to this script: {e}")
     sys.exit(1)
 
 # ROS2 imports
@@ -181,14 +194,32 @@ class MultiVideoRosBag2HDF5Converter:
         # chassis tracking
         self._cur_chassis_state_msg = np.zeros(CHASSIS_DIM, dtype=np.float32)
         self._cur_chassis_action_msg = np.zeros(CHASSIS_DIM, dtype=np.float32)
-        # Latest decoded BGR frame from HEVC decoder.
-        self._cur_video_bgr_frame = {camera_key: None for camera_key in self.video_topics.keys()}
-        # Monotonic generation id per camera for deduplicating JPEG re-encode.
-        self._cur_video_frame_gen = {camera_key: 0 for camera_key in self.video_topics.keys()}
-        # per-camera HEVC decoder context
-        self._video_decoders = {}
         # action tracking
         self._cur_action_msg = np.zeros(STATE_ACTION_DIM, dtype=np.float32)
+
+        # Reverse topic -> camera_key map (avoids a linear scan per message)
+        self.topic_to_camera = {topic: cam for cam, topic in self.video_topics.items()}
+        # Actual frame dimensions per camera, taken from the FFMPEGPacket msgs
+        self._video_dims = {}
+        # Lazy state/action deserialization: raw CDR bytes are cached per
+        # topic and only the latest message per topic is deserialized when a
+        # frame is actually captured (identical result, ~10x fewer deserializes)
+        self._dirty_state = {}
+        self._dirty_action = {}
+
+        # Raw HEVC packet buffering. GOP != 1: every episode must include the
+        # packets from the last IDR before its X press, and every packet of
+        # the episode, so the decoder can rebuild the reference chain.
+        self._window_size = 60
+        self._recent_packets = {ck: deque(maxlen=self._window_size) for ck in self.video_topics.keys()}
+        self._ep_packets = None      # {camera_key: [ {'data','ts'}, ... ]} while recording
+        self._ep_row_ticks = []      # grid tick index of each written row
+
+        # NVDEC-accelerated decode when a GPU is present (CPU fallback inside
+        # the extractor). Decoding has no NVENC-style session cap.
+        self.n_gpus = detect_gpu_count()
+        self._episode_seq = 0
+        self.logger.info(f"Detected {self.n_gpus} NVIDIA GPU(s) for video decode")
 
         # Global episode index across all bags (used for output naming).
         self.start_episode_idx = max(0, int(start_episode_idx))
@@ -216,8 +247,6 @@ class MultiVideoRosBag2HDF5Converter:
         self._ep_ds_chassis_action = None
         self._ep_images_grp = None
         self._ep_image_ds = {}
-        self._ep_last_image_bytes = {}
-        self._ep_last_encoded_gen = {}
         self._ep_blank_image_bytes = {}
 
     def __del__(self):
@@ -225,34 +254,6 @@ class MultiVideoRosBag2HDF5Converter:
             self.close()
         except Exception:
             pass
-
-    def _init_video_decoders(self):
-        """Initialize one HEVC decoder per camera topic."""
-        self._video_decoders = {}
-        for camera_key in self.video_topics.keys():
-            try:
-                codec = av.CodecContext.create("hevc", "r")
-                codec.options = {"threads": "auto"}
-                self._video_decoders[camera_key] = codec
-            except Exception as e:
-                self.logger.error(f"Failed to init HEVC decoder for {camera_key}: {e}")
-                self._video_decoders[camera_key] = None
-
-    def _close_video_decoders(self):
-        """Flush delayed frames and release decoder refs."""
-        for camera_key, codec in self._video_decoders.items():
-            if codec is None:
-                continue
-            try:
-                # Flush delayed B/P frames and keep the latest decoded frame.
-                delayed = codec.decode(None)
-                if delayed:
-                    bgr = delayed[-1].to_ndarray(format="bgr24")
-                    self._cur_video_bgr_frame[camera_key] = bgr
-                    self._cur_video_frame_gen[camera_key] += 1
-            except Exception:
-                pass
-        self._video_decoders = {}
 
     def close(self):
         """Discard any unfinished episode file and release background workers."""
@@ -263,6 +264,10 @@ class MultiVideoRosBag2HDF5Converter:
             self._jpeg_executor = None
 
     def _camera_hw_from_meta(self, camera_key: str) -> tuple[int, int]:
+        # Actual bitstream dimensions (from FFMPEGPacket) are authoritative
+        dims = self._video_dims.get(camera_key)
+        if dims is not None:
+            return int(dims[1]), int(dims[0])
         info = self._camera_info_cache.get(camera_key)
         if info is not None and info.get("height", 0) > 0 and info.get("width", 0) > 0:
             return int(info["height"]), int(info["width"])
@@ -386,10 +391,9 @@ class MultiVideoRosBag2HDF5Converter:
         self._ep_ds_chassis_action.attrs["names"] = chassis_feature_names
 
         self._ep_image_ds = {}
-        self._ep_last_image_bytes = {}
-        self._ep_last_encoded_gen = {}
         self._ep_blank_image_bytes = {}
         self._ep_n_frames = 0
+        self._ep_row_ticks = []
 
     def _ensure_episode_image_dataset(self, camera_key: str):
         ds = self._ep_image_ds.get(camera_key)
@@ -414,7 +418,12 @@ class MultiVideoRosBag2HDF5Converter:
         return ds
 
     def _append_episode_frame(self, frame_data: dict):
-        """Append one fully-formed frame sample to current episode HDF5."""
+        """Append one scalar frame sample to current episode HDF5.
+
+        Images are NOT written here: raw packets are buffered during the
+        episode and decoded/JPEG-encoded in one pass at episode end
+        (see _write_episode_images).
+        """
         if self._ep_h5 is None:
             return
 
@@ -433,49 +442,106 @@ class MultiVideoRosBag2HDF5Converter:
         self._ep_ds_action[i] = frame_data["action"]
         self._ep_ds_chassis_action[i] = frame_data["chassis_action"]
 
-        pending = {}
-        for camera_key in self.video_topics.keys():
-            img = frame_data.get(f"observation.images.{camera_key}")
-            gen = frame_data.get(f"observation.images_gen.{camera_key}")
-            if img is None:
-                continue
-            should_encode = True
-            if gen is not None:
-                last_gen = self._ep_last_encoded_gen.get(camera_key)
-                should_encode = (last_gen != gen)
-            if not should_encode:
-                continue
-
-            if self._jpeg_executor is None:
-                enc = self._encode_jpeg(img)
-                if enc is not None:
-                    self._ep_last_image_bytes[camera_key] = enc
-                    if gen is not None:
-                        self._ep_last_encoded_gen[camera_key] = gen
-            else:
-                pending[camera_key] = (gen, self._jpeg_executor.submit(self._encode_jpeg, img))
-
-        for camera_key, (gen, future) in pending.items():
-            enc = future.result()
-            if enc is not None:
-                self._ep_last_image_bytes[camera_key] = enc
-                if gen is not None:
-                    self._ep_last_encoded_gen[camera_key] = gen
-
-        for camera_key in self.video_topics.keys():
-            ds = self._ensure_episode_image_dataset(camera_key)
-            ds.resize((n,))
-            frame_bytes = self._ep_last_image_bytes.get(camera_key)
-            if frame_bytes is None:
-                frame_bytes = self._get_or_make_blank_bytes(camera_key)
-            if frame_bytes is None:
-                # Last-resort fallback if JPEG encoding unexpectedly failed.
-                frame_bytes = np.empty((0,), dtype=np.uint8)
-            ds[i] = frame_bytes
+        self._ep_row_ticks.append(int(frame_data["tick_index"]))
 
         self._ep_n_frames = n
         if n % 256 == 0:
             self._ep_h5.flush()
+
+    def _extract_camera_jpegs(self, camera_key: str, first_tick_time: float,
+                              n_grid: int, row_ticks: list, gpu_index: int) -> list:
+        """Decode one camera's episode packets and JPEG-encode the row frames.
+
+        Returns a list of JPEG byte arrays aligned with the episode rows
+        (row i shows the latest camera frame at row i's grid tick).
+        """
+        packets = self._ep_packets.get(camera_key) or []
+        if not packets:
+            blank = self._get_or_make_blank_bytes(camera_key)
+            return [blank] * len(row_ticks)
+
+        width, height = self._video_dims[camera_key]
+        needed = set(row_ticks)
+        by_tick = {}
+        pending = {}
+        frames = extract_grid_frames(
+            packets, first_tick_time, n_grid, self.fps,
+            out_width=width, out_height=height,
+            gpu_index=gpu_index, use_gpu=self.n_gpus > 0, logger=self.logger,
+        )
+        for tick, frame in enumerate(frames):
+            if tick not in needed:
+                continue
+            if self._jpeg_executor is None:
+                by_tick[tick] = self._encode_jpeg(frame)
+            else:
+                # copy: the generator may reuse/overwrite its buffer
+                pending[tick] = self._jpeg_executor.submit(self._encode_jpeg, frame.copy())
+                # Bound in-flight raw-frame copies (4K frames are ~22MB each):
+                # resolve the oldest submissions once the queue grows
+                while len(pending) > 24:
+                    oldest = next(iter(pending))
+                    by_tick[oldest] = pending.pop(oldest).result()
+        for tick, future in pending.items():
+            by_tick[tick] = future.result()
+
+        blank = None
+        result = []
+        for tick in row_ticks:
+            enc = by_tick.get(tick)
+            if enc is None:
+                if blank is None:
+                    blank = self._get_or_make_blank_bytes(camera_key)
+                enc = blank
+            result.append(enc)
+        return result
+
+    def _start_episode_packets(self, start_time: float):
+        """Begin buffering episode packets, primed from each camera's last IDR.
+
+        The sliding window holds >= one GOP of recent packets; starting the
+        episode buffer at the last IDR before the X press gives the decoder a
+        complete reference chain (no info loss, no undecodable leading frames).
+        """
+        self._ep_packets = {}
+        for camera_key in self.video_topics.keys():
+            primed = packets_from_last_idr(self._recent_packets[camera_key])
+            self._ep_packets[camera_key] = list(primed)
+            if primed:
+                self.logger.info(
+                    f"  📹 {camera_key}: primed {len(primed)} pkts from IDR at "
+                    f"{primed[0]['ts']:.3f}s (X at {start_time:.3f}s)"
+                )
+            else:
+                self.logger.warning(
+                    f"  ⚠️ {camera_key}: no IDR in recent window — episode may "
+                    f"start with blank frames until the next IDR"
+                )
+
+    def _write_episode_images(self, start_time: float):
+        """Decode all cameras (in parallel) and fill the episode image datasets."""
+        row_ticks = self._ep_row_ticks
+        if not row_ticks:
+            return
+        first_tick_time = start_time + self.frame_duration
+        n_grid = row_ticks[-1] + 1
+        gpu_index = self._episode_seq % max(1, self.n_gpus)
+        self._episode_seq += 1
+
+        with ThreadPoolExecutor(max_workers=len(self.video_topics)) as cam_pool:
+            futures = {
+                camera_key: cam_pool.submit(
+                    self._extract_camera_jpegs, camera_key,
+                    first_tick_time, n_grid, row_ticks, gpu_index,
+                )
+                for camera_key in self.video_topics.keys()
+            }
+            for camera_key, future in futures.items():
+                jpegs = future.result()
+                ds = self._ensure_episode_image_dataset(camera_key)
+                ds.resize((len(jpegs),))
+                for i, enc in enumerate(jpegs):
+                    ds[i] = enc if enc is not None else np.empty((0,), dtype=np.uint8)
 
     def _reset_message_caches(self):
         """Zero the state/action caches so a new episode cannot start with
@@ -484,6 +550,8 @@ class MultiVideoRosBag2HDF5Converter:
         self._cur_action_msg = np.zeros(STATE_ACTION_DIM, dtype=np.float32)
         self._cur_chassis_state_msg = np.zeros(CHASSIS_DIM, dtype=np.float32)
         self._cur_chassis_action_msg = np.zeros(CHASSIS_DIM, dtype=np.float32)
+        self._dirty_state.clear()
+        self._dirty_action.clear()
 
     def _note_frame_time_gap(self, frame_target_t: float):
         """Track real bag-time gaps between consecutive sampled frames.
@@ -557,9 +625,8 @@ class MultiVideoRosBag2HDF5Converter:
         self._ep_ds_chassis_action = None
         self._ep_images_grp = None
         self._ep_image_ds = {}
-        self._ep_last_image_bytes = {}
-        self._ep_last_encoded_gen = {}
         self._ep_blank_image_bytes = {}
+        self._ep_row_ticks = []
         return n
 
 
@@ -853,66 +920,62 @@ class MultiVideoRosBag2HDF5Converter:
         elif topicName == self.chassis_action_topic:
             self._cur_chassis_action_msg[:] = chassis_data
 
-    def _update_video_frame(self, topicName:str, msg:FFMPEGPacket):
-        camera_key = self._get_camera_key_from_topic(topicName)
-        if camera_key:
-            codec = self._video_decoders.get(camera_key)
-            if codec is None:
-                return
-
-            try:
-                payload = msg.data
-                if not isinstance(payload, (bytes, bytearray, memoryview)):
-                    payload = bytes(payload)
-                pkt = av.Packet(payload)
-                if hasattr(msg, "pts"):
-                    pkt.pts = int(msg.pts)
-
-                decoded = codec.decode(pkt)
-                if decoded:
-                    # Keep only the latest frame for current timestep sampling.
-                    # Decode directly to BGR for OpenCV JPEG encoder to avoid RGB->BGR conversion.
-                    bgr = decoded[-1].to_ndarray(format="bgr24")
-                    self._cur_video_bgr_frame[camera_key] = bgr
-                    self._cur_video_frame_gen[camera_key] += 1
-            except Exception as e:
-                self.logger.warning(f"HEVC decode failed on {camera_key}: {e}")
-        
     def update_messages(self, topicName, data):
-        """Use a single interface to update state, video_frame, and action"""
-        msg_type = self.topic_types_dict.get(topicName)
-        if not msg_type:
-            pass
-        else:
-            msg_class = get_message(msg_type)
+        """Use a single interface to update state, video packet, and action.
+
+        Video packets are buffered raw (decode happens once per episode at
+        save time); state/action messages just cache their raw bytes — only
+        the latest message per topic matters, so deserialization is deferred
+        to the capture ticks (see _materialize_state/_materialize_action).
+        """
+        if topicName in self.video_topics_set:
+            msg_class = self.topic_msg_class.get(topicName)
+            if msg_class is None:
+                return
             msg = deserialize_message(data, msg_class)
+            camera_key = self.topic_to_camera[topicName]
+            if camera_key not in self._video_dims:
+                self._video_dims[camera_key] = (int(msg.width), int(msg.height))
+            self._cur_video_packet = (camera_key, bytes(msg.data))
 
-            if topicName in self.state_topics_set:
-                self._update_state_msg(topicName, msg)
+        elif topicName in self.state_topics_set or topicName == self.chassis_state_topic:
+            if topicName in self.topic_msg_class:
+                self._dirty_state[topicName] = data
 
-            elif topicName in self.action_topics_set:
-                self._update_action_msg(topicName, msg)
+        elif topicName in self.action_topics_set or topicName == self.chassis_action_topic:
+            if topicName in self.topic_msg_class:
+                self._dirty_action[topicName] = data
 
-            elif topicName in self.chassis_topics_set:
-                self._update_chassis_msg(topicName, msg)
+    def _materialize_state(self):
+        """Apply the latest cached raw message of each state/chassis-state topic."""
+        if self._dirty_state:
+            for topic, raw in self._dirty_state.items():
+                msg = deserialize_message(raw, self.topic_msg_class[topic])
+                if topic == self.chassis_state_topic:
+                    self._update_chassis_msg(topic, msg)
+                else:
+                    self._update_state_msg(topic, msg)
+            self._dirty_state.clear()
 
-            elif topicName in self.video_topics_set:
-                self._update_video_frame(topicName, msg)
-    
+    def _materialize_action(self):
+        """Apply the latest cached raw message of each action/chassis-action topic."""
+        if self._dirty_action:
+            for topic, raw in self._dirty_action.items():
+                msg = deserialize_message(raw, self.topic_msg_class[topic])
+                if topic == self.chassis_action_topic:
+                    self._update_chassis_msg(topic, msg)
+                else:
+                    self._update_action_msg(topic, msg)
+            self._dirty_action.clear()
+
     def add_state_and_video_packet(self, frame_data:dict):
-        """Record current state and per-camera decoded frames into frame_data."""
+        """Record current state into frame_data (images are extracted at save time)."""
+        self._materialize_state()
         frame_data["observation.state"] = self._cur_state_msg.copy()
         frame_data["observation.chassis_state"] = self._cur_chassis_state_msg.copy()
 
-        for camera_key, image in self._cur_video_bgr_frame.items():
-            if image is not None:
-                frame_data[f"observation.images.{camera_key}"] = image
-                frame_data[f"observation.images_gen.{camera_key}"] = self._cur_video_frame_gen[camera_key]
-            else:
-                frame_data[f"observation.images.{camera_key}"] = None
-                frame_data[f"observation.images_gen.{camera_key}"] = None
-
     def add_action(self, frame_data:dict):
+        self._materialize_action()
         frame_data['action'] = self._cur_action_msg.copy()
         frame_data['chassis_action'] = self._cur_chassis_action_msg.copy()
 
@@ -959,11 +1022,25 @@ class MultiVideoRosBag2HDF5Converter:
 
         # Collect camera intrinsics once before the main loop
         self._camera_info_cache = self._collect_camera_info(rosbag)
-        # Initialize HEVC decoders for this bag
-        self._init_video_decoders()
 
-        non_recording_filter = StorageFilter(topics=['/xr/left_hand_inputs'])
-        reader.set_filter(non_recording_filter)
+        # Cache deserialization classes once per bag (get_message is not free
+        # at ~1M calls per bag)
+        self.topic_msg_class = {
+            t: get_message(ty) for t, ty in self.topic_types_dict.items()
+        }
+        self._dirty_state.clear()
+        self._dirty_action.clear()
+
+        # Read all consumed topics continuously: video packets must be
+        # buffered even between episodes so each X press can rewind to the
+        # last IDR keyframe (GOP != 1: starting mid-GOP is undecodable).
+        needed_topics = list(self.all_topics_set | {'/xr/left_hand_inputs'})
+        reader.set_filter(StorageFilter(topics=needed_topics))
+
+        # Sliding window of recent raw packets per camera (covers >= one GOP)
+        self._recent_packets = {ck: deque(maxlen=self._window_size) for ck in self.video_topics.keys()}
+        self._ep_packets = None
+        self._cur_video_packet = None
 
         x_button, y_button = 2, 3
         is_recording = False
@@ -997,6 +1074,15 @@ class MultiVideoRosBag2HDF5Converter:
 
             self.update_messages(topic, data)
 
+            # --- Maintain sliding window / episode buffer of raw video packets ---
+            camera_key = self.topic_to_camera.get(topic)
+            if camera_key is not None and self._cur_video_packet is not None:
+                pkt = {'data': self._cur_video_packet[1], 'ts': timestamp}
+                self._recent_packets[camera_key].append(pkt)
+                if is_recording and self._ep_packets is not None:
+                    self._ep_packets[camera_key].append(pkt)
+                self._cur_video_packet = None
+
             if topic == '/xr/left_hand_inputs':
                 try:
                     buttons = deserialize_message(data, Joy).buttons
@@ -1005,12 +1091,10 @@ class MultiVideoRosBag2HDF5Converter:
                         if previous_buttons is not None:
                             if   (previous_buttons[x_button] == 0 and buttons[x_button] == 1 and not is_recording):
                                 is_recording = True
-                                reader.reset_filter()
                                 start_time = timestamp
                                 self.logger.info(f"🔴 Start #Episode: {self.num_xy_pairs}")
-                                self._cur_video_bgr_frame = {camera_key: None for camera_key in self.video_topics.keys()}
-                                self._cur_video_frame_gen = {camera_key: 0 for camera_key in self.video_topics.keys()}
                                 self._reset_message_caches()
+                                self._start_episode_packets(start_time)
                                 self._begin_episode_hdf5(
                                     episode_index=self.total_episodes_saved,
                                     task_description=task_description,
@@ -1028,9 +1112,8 @@ class MultiVideoRosBag2HDF5Converter:
                                 is_recording = True
                                 start_time = timestamp
                                 self.logger.info(f"🔴 Re-record #Episode: {self.num_xy_pairs}")
-                                self._cur_video_bgr_frame = {camera_key: None for camera_key in self.video_topics.keys()}
-                                self._cur_video_frame_gen = {camera_key: 0 for camera_key in self.video_topics.keys()}
                                 self._reset_message_caches()
+                                self._start_episode_packets(start_time)
                                 # Drop previous unfinished recording and restart.
                                 self._finalize_episode_hdf5(keep=False)
                                 self._begin_episode_hdf5(
@@ -1048,7 +1131,6 @@ class MultiVideoRosBag2HDF5Converter:
 
                             if (previous_buttons[y_button] == 0 and buttons[y_button] == 1 and is_recording):
                                 is_recording = False
-                                reader.set_filter(non_recording_filter)
                                 end_time = timestamp
                                 duration = end_time - start_time
                                 self.logger.info(f"⏹️ Stop TimeRange: {start_time:.3f} to {end_time:.3f} seconds. Duration: {duration:.3f} seconds")
@@ -1059,8 +1141,10 @@ class MultiVideoRosBag2HDF5Converter:
                                 if n_written < MIN_EPISODE_LENGTH:
                                     self._finalize_episode_hdf5(keep=False)
                                 else:
+                                    self._write_episode_images(start_time)
                                     self._finalize_episode_hdf5(keep=True)
                                     self.total_episodes_saved += 1
+                                self._ep_packets = None
 
                                 episode_state_target_t = None
                                 episode_action_target_t = None
@@ -1079,6 +1163,11 @@ class MultiVideoRosBag2HDF5Converter:
 
                 elif episode_state_target_t <= timestamp <= episode_action_target_t and not is_in_adding_phase:
                     self.add_state_and_video_packet(frame_data)
+                    # Grid tick index of this row (tick 0 = start_time + 1/fps);
+                    # used to pick the matching video frame at save time
+                    frame_data["tick_index"] = int(round(
+                        (episode_state_target_t - start_time) * self.fps
+                    )) - 1
                     is_in_adding_phase = True
 
                 elif timestamp > episode_action_target_t and is_in_adding_phase:
@@ -1124,7 +1213,6 @@ class MultiVideoRosBag2HDF5Converter:
         if self._ep_h5 is not None:
             self._finalize_episode_hdf5(keep=False)
 
-        self._close_video_decoders()
         del reader
 
 
@@ -1209,6 +1297,7 @@ class MultiVideoRosBag2HDF5Converter:
         self.logger.info(f"  转换耗时           : {_fmt_duration(_convert_elapsed)}  ({_convert_elapsed:.1f}s)")
         self.logger.info(f"  输出目录           : {self.output_directory}")
         self.logger.info(sep)
+        return True
 
 
 def setup_logging_to_file(log_file_path):

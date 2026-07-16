@@ -39,6 +39,7 @@ A toolkit for converting ROS2 bag files (`.db3` / `.mcap`) into LeRobot v2.1 dat
 - **ROS2 Version**: Humble
 - **Python Version**: 3.11
 - **CUDA Version**: 12.6+ (tested with 12.8)
+- **GPU**: NVIDIA GPU with NVDEC/NVENC strongly recommended — the LeRobot converter re-encodes all episode videos and is GPU-accelerated (an automatic CPU fallback exists but is far slower)
 - **LeRobot Version**: 0.3.3 (Modified)
 - **Dataset Format**: v2.1
 - **Conda/Anaconda**: For environment management
@@ -105,6 +106,7 @@ All converters accept both rosbag2 storage formats and pick the storage plugin a
 | State (62 dims) | `/left_arm/joint_states`, `/right_arm/joint_states`, `/left_gripper/joint_states`, `/right_gripper/joint_states`, `/left_arm/current_ee_pose`, `/right_arm/current_ee_pose` |
 | Action (62 dims) | `/left_arm/joint_cmd`, `/right_arm/joint_cmd`, `/left_gripper/joint_cmd`, `/right_gripper/joint_cmd`, `/left_arm/target_ee_pose`, `/right_arm/target_ee_pose` |
 | Chassis (9 dims) | `/chassis/joint_states` (state), `/chassis/joint_cmd` (action) |
+| Kinco lift (1 dim, LeRobot converter) | `/kinco/actual_velocity` (state), `/kinco/cmd_velocity` (action) |
 
 ## 📖 Usage
 
@@ -115,6 +117,8 @@ This project provides conversion workflows for LeRobot, HDF5, and TFDS RLDS data
 **Use case**: Rosbags contain operator start (X key) and end (Y key) markers; each bag may contain multiple episodes.
 
 **Script**: `scripts/convert_rosbag_to_lerobot.py`
+
+Episode videos are re-encoded to GOP = 1 (every frame an IDR keyframe), GPU-accelerated on NVIDIA cards with an automatic CPU fallback.
 
 ```bash
 # Activate conda environment (ROS2 is already included)
@@ -132,6 +136,8 @@ python scripts/convert_rosbag_to_lerobot.py \
   --task "task description"
 ```
 
+**Output features**: `observation.state` and `action` are 72-dimensional — 62 arm/gripper dims (16 joint positions, 16 velocities, 16 efforts, 14 EE pose values) + 9 chassis dims (3 motors × position/velocity/effort) + 1 kinco lift velocity. The three camera views are stored as per-episode MP4 videos (`observation.images.left_color` / `right_color` / `head_camera`).
+
 **Parameters**:
 - `--input_directory`: Directory containing ROS2 bag files (default: `./data/rosbags`)
 - `--output`, `-o`: Output dataset name (format: `username/dataset_name`)
@@ -139,13 +145,18 @@ python scripts/convert_rosbag_to_lerobot.py \
 - `--task`: Task description
 - `--multibag`: (Optional) Use if the directory contains multiple rosbag folders
 - `--enforce_all_video_topics`: (Optional) Skip bags missing any of the three video topics
+- `--whole_bag`: (Optional) Treat each entire bag as one continuous episode (no X/Y markers needed)
+- `--crf`: (Optional) Encoder quality — constant QP on GPU / CRF on CPU; lower = better quality, larger files (default: 23)
+- `--nvenc_sessions`: (Optional) Max concurrent GPU encode sessions (default: 7). Consumer NVIDIA drivers cap NVENC sessions system-wide; lower this to 5 or 3 if GPU encodes fail on drivers older than 550/522
+- `--max_episodes`: (Optional) Stop after N episodes — handy for a quick test run
+- `--verbose`: (Optional) Print progress to the terminal instead of the log file
 - `--log_file`: (Optional) Log file path (default: `scripts/logs/convert_rosbag_to_lerobot_<timestamp>.log`)
 
 ### Scenario 2: Convert to HDF5 Format
 
-**Use case**: Convert rosbags with X/Y markers directly to HDF5. Each episode is saved as an independent `episode_XXXXXX.hdf5` file. HEVC video is decoded in real time (PyAV) and stored as per-frame JPEG bytes — decode with `cv2.imdecode`.
+**Use case**: Convert rosbags with X/Y markers directly to HDF5. Each episode is saved as an independent `episode_XXXXXX.hdf5` file. HEVC video is decoded per episode (NVDEC GPU-accelerated when available, with automatic CPU fallback) and stored as per-frame JPEG bytes — decode with `cv2.imdecode`.
 
-**Script**: `scripts/convert_rosbag_to_hdf5.py`
+**Script**: `scripts/convert_rosbag_to_hdf5.py` (uses the shared `scripts/rosbag_video_extraction.py` helper)
 
 **Output structure**:
 ```
@@ -191,14 +202,14 @@ python scripts/convert_rosbag_to_hdf5.py \
 - `--start_episode_idx`: Starting index for output episode numbering (default: 0). Use this to append to an output directory that already contains episodes.
 - `--overwrite`: Allow replacing existing `episode_*.hdf5` files. Without it, the script refuses to start if new episode indices would collide with existing files.
 - `--jpeg_quality`: JPEG encode quality 1–100 (default: 85)
-- `--jpeg_workers`: Number of JPEG encoding threads; 0 = synchronous (default: 0)
+- `--jpeg_workers`: Number of JPEG encoding threads; 0 = synchronous (default: 0; 4–8 recommended on multi-core machines)
 - `--log_file`: (Optional) Log file path (default: `scripts/logs/convert_rosbag_to_hdf5_<timestamp>.log`)
 
 ### Scenario 3: Build TFDS RLDS Dataset for OpenVLA
 
-**Use case**: Build an OpenVLA-style TFDS RLDS dataset directly from ROS2 bags with X/Y episode markers. The TFDS builder discovers `.db3`/`.mcap` bags, segments episodes, samples frames at the target FPS, decodes HEVC camera packets (the head camera's side-by-side stereo image is cropped to its left half), resizes images to 224x224, and writes TFDS train shards (a single `train` split).
+**Use case**: Build an OpenVLA-style TFDS RLDS dataset directly from ROS2 bags with X/Y episode markers. The TFDS builder discovers `.db3`/`.mcap` bags, segments episodes, samples frames at the target FPS, decodes HEVC camera packets per episode (NVDEC GPU-accelerated when available, automatic CPU fallback; the head camera's side-by-side stereo image is cropped to its left half), resizes images to 224x224, and writes TFDS train shards (a single `train` split).
 
-**Builder**: `rosbag_rlds_tfds/rosbag_rlds_tfds_dataset_builder.py` — it dynamically loads the conversion logic from `scripts/convert_rosbag_to_rlds.py`, so both files must stay at their current locations.
+**Builder**: `rosbag_rlds_tfds/rosbag_rlds_tfds_dataset_builder.py` — it dynamically loads the conversion logic from `scripts/convert_rosbag_to_rlds.py` (which in turn imports `scripts/rosbag_video_extraction.py`), so these files must stay at their current locations.
 
 **Output structure**:
 ```text
@@ -388,6 +399,7 @@ rosbag_to_lerobot/
 │   ├── convert_rosbag_to_lerobot.py    # Rosbags with X/Y markers → LeRobot dataset
 │   ├── convert_rosbag_to_hdf5.py       # Rosbags with X/Y markers → per-episode HDF5 (JPEG frames)
 │   ├── convert_rosbag_to_rlds.py       # Rosbag → RLDS episodes (used by the TFDS builder)
+│   ├── rosbag_video_extraction.py      # Shared HEVC packet buffering + GPU frame extraction
 │   ├── validate_rosbags.py             # Pre-conversion bag statistics
 │   ├── merge_datasets.py               # Merge multiple LeRobot datasets
 │   ├── delete_wrong_episodes.py        # Delete specific episodes from a dataset

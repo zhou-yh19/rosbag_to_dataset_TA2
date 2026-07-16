@@ -12,8 +12,12 @@ This script follows the same recording and frame alignment logic as
 Compared with low-level tf.train.Feature writing, this script defines data format via
 `tfds.features` first, then encodes examples using `features.encode_example`.
 
-Camera data is decoded from raw HEVC packets, resized to 224x224, and stored as PNG.
-To limit memory usage, frames are kept as compressed PNG bytes in memory.
+The robot's camera streams are H.265 with inter-coded GOPs. Raw packets are
+buffered per episode (starting at the last IDR keyframe before the X press so
+the whole GOP chain is decodable), then decoded in one ffmpeg pass per camera
+— NVDEC GPU-accelerated when available, software decode otherwise. Sampled
+frames are cropped (head camera keeps its left half), resized to 224x224 and
+stored as PNG bytes.
 
 Output layout:
   output_directory/
@@ -59,22 +63,38 @@ import argparse
 from pathlib import Path
 import logging
 import traceback
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
-# Force CPU-only TensorFlow and suppress noisy startup logs, unless the caller
-# already set these explicitly. Keep this before importing tensorflow.
+# Suppress noisy TensorFlow startup logs. Keep this before importing tensorflow.
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
-os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
 
 import tensorflow as tf
 import tensorflow_datasets as tfds
 from tensorflow_datasets.core import example_serializer
+
+# Keep TensorFlow off the GPU (it only encodes PNGs here) WITHOUT masking
+# CUDA_VISIBLE_DEVICES: the ffmpeg subprocesses need the GPUs for NVDEC.
 try:
-    import av
+    tf.config.set_visible_devices([], 'GPU')
+except Exception:
+    pass
+
+# Shared packet-buffering / GPU frame-extraction machinery (same directory).
+# sys.path insert is required because the TFDS builder loads this file via
+# importlib.spec_from_file_location, which does not add its directory to the
+# module search path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from rosbag_video_extraction import (
+        detect_gpu_count,
+        extract_grid_frames,
+        packets_from_last_idr,
+    )
 except ImportError as e:
     raise ImportError(
-        "PyAV dependency not found. Install it in the current env, e.g. "
-        "`pip install av` or `conda install -c conda-forge av`."
+        f"rosbag_video_extraction module not found next to this script: {e}"
     ) from e
 
 
@@ -162,19 +182,32 @@ class MultiVideoRosBag2RLDSConverter:
         self._target_image_h, self._target_image_w = TARGET_IMAGE_SIZE
         self._empty_rgb_frame = np.zeros((self._target_image_h, self._target_image_w, 3), dtype=np.uint8)
         self._empty_png_bytes = tf.io.encode_png(self._empty_rgb_frame).numpy()
-        self._cur_video_png = {
-            camera_key: self._empty_png_bytes
-            for camera_key in self.video_topics.keys()
-        }
-        self._video_decoders = {
-            camera_key: av.CodecContext.create('hevc', 'r')
-            for camera_key in self.video_topics.keys()
-        }
-        self._video_decode_error_counter = {
-            camera_key: 0
-            for camera_key in self.video_topics.keys()
-        }
         self._cur_action_msg = np.zeros(STATE_ACTION_DIM, dtype=np.float32)
+
+        # Reverse topic -> camera_key map (avoids a linear scan per message)
+        self.topic_to_camera = {topic: cam for cam, topic in self.video_topics.items()}
+        # Actual frame dimensions per camera, taken from the FFMPEGPacket msgs
+        self._video_dims = {}
+        # Lazy state/action deserialization: raw CDR bytes are cached per
+        # topic and only the latest message per topic is deserialized when a
+        # frame is actually captured (identical result, ~10x fewer deserializes)
+        self._dirty_state = {}
+        self._dirty_action = {}
+        self._cur_video_packet = None
+
+        # Raw HEVC packet buffering. GOP != 1: every episode must include the
+        # packets from the last IDR before its X press, and every packet of
+        # the episode, so the decoder can rebuild the reference chain.
+        self._window_size = 60
+        self._recent_packets = {ck: deque(maxlen=self._window_size) for ck in self.video_topics.keys()}
+        self._ep_packets = None
+
+        # NVDEC-accelerated decode when a GPU is present (CPU fallback inside
+        # the extractor). TensorFlow itself is kept off the GPU via
+        # tf.config.set_visible_devices at import time.
+        self.n_gpus = detect_gpu_count()
+        self._episode_seq = 0
+        self.logger.info(f"Detected {self.n_gpus} NVIDIA GPU(s) for video decode")
 
         # Global episode index across all bags
         self.total_episodes_saved = 0
@@ -300,20 +333,92 @@ class MultiVideoRosBag2RLDSConverter:
             return (480, 848, 3)
 
     def _reset_video_runtime_state(self):
-        """Reset decoder/image runtime state to avoid cross-bag accumulation."""
-        self._video_decoders = {
-            camera_key: av.CodecContext.create('hevc', 'r')
-            for camera_key in self.video_topics.keys()
-        }
-        self._video_decode_error_counter = {
-            camera_key: 0
-            for camera_key in self.video_topics.keys()
-        }
-        self._cur_video_png = {
-            camera_key: self._empty_png_bytes
-            for camera_key in self.video_topics.keys()
-        }
+        """Reset packet-buffer runtime state to avoid cross-bag accumulation."""
+        self._recent_packets = {ck: deque(maxlen=self._window_size) for ck in self.video_topics.keys()}
+        self._ep_packets = None
+        self._cur_video_packet = None
         gc.collect()
+
+    def _start_episode_packets(self, start_time: float):
+        """Begin buffering episode packets, primed from each camera's last IDR.
+
+        The sliding window holds >= one GOP of recent packets; starting the
+        episode buffer at the last IDR before the X press gives the decoder a
+        complete reference chain (no info loss, no undecodable leading frames).
+        """
+        self._ep_packets = {}
+        for camera_key in self.video_topics.keys():
+            primed = packets_from_last_idr(self._recent_packets[camera_key])
+            self._ep_packets[camera_key] = list(primed)
+            if primed:
+                self.logger.info(
+                    f"  📹 {camera_key}: primed {len(primed)} pkts from IDR at "
+                    f"{primed[0]['ts']:.3f}s (X at {start_time:.3f}s)"
+                )
+            else:
+                self.logger.warning(
+                    f"  ⚠️ {camera_key}: no IDR in recent window — episode may "
+                    f"start with blank frames until the next IDR"
+                )
+
+    def _extract_camera_pngs(self, camera_key: str, first_tick_time: float,
+                             n_grid: int, row_ticks: list, gpu_index: int) -> list:
+        """Decode one camera's episode packets and PNG-encode the row frames.
+
+        Frames are sampled on the fps grid (floor semantics), the head
+        camera's side-by-side stereo image is cropped to its left half, and
+        every frame is resized to 224x224 before PNG encoding. Returns a list
+        of PNG bytes aligned with the episode rows.
+        """
+        packets = (self._ep_packets or {}).get(camera_key) or []
+        if not packets:
+            return [self._empty_png_bytes] * len(row_ticks)
+
+        vf_post = "scale=%d:%d" % (self._target_image_w, self._target_image_h)
+        if camera_key == 'head_camera':
+            # Side-by-side stereo: keep the left half before resizing
+            vf_post = "crop=iw/2:ih:0:0," + vf_post
+
+        needed = set(row_ticks)
+        by_tick = {}
+        frames = extract_grid_frames(
+            packets, first_tick_time, n_grid, self.fps,
+            out_width=self._target_image_w, out_height=self._target_image_h,
+            vf_post=vf_post,
+            gpu_index=gpu_index, use_gpu=self.n_gpus > 0, logger=self.logger,
+        )
+        for tick, frame_bgr in enumerate(frames):
+            if tick not in needed:
+                continue
+            frame_rgb = np.ascontiguousarray(frame_bgr[:, :, ::-1])
+            by_tick[tick] = tf.io.encode_png(frame_rgb).numpy()
+
+        return [by_tick.get(tick, self._empty_png_bytes) for tick in row_ticks]
+
+    def _inject_episode_images(self, episode_frames: list, start_time: float):
+        """Decode all cameras (in parallel) and fill PNGs into episode_frames."""
+        if not episode_frames:
+            return
+        row_ticks = [frame['tick_index'] for frame in episode_frames]
+        first_tick_time = start_time + self.frame_duration
+        n_grid = row_ticks[-1] + 1
+        gpu_index = self._episode_seq % max(1, self.n_gpus)
+        self._episode_seq += 1
+
+        with ThreadPoolExecutor(max_workers=len(self.video_topics)) as cam_pool:
+            futures = {
+                camera_key: cam_pool.submit(
+                    self._extract_camera_pngs, camera_key,
+                    first_tick_time, n_grid, row_ticks, gpu_index,
+                )
+                for camera_key in self.video_topics.keys()
+            }
+            for camera_key, future in futures.items():
+                pngs = future.result()
+                for frame, png in zip(episode_frames, pngs):
+                    frame[f'observation.{camera_key}'] = png
+        for frame in episode_frames:
+            frame.pop('tick_index', None)
 
     def _clear_episode_frames(self, episode_frames: list):
         """Explicitly release per-episode memory after save/skip."""
@@ -322,13 +427,6 @@ class MultiVideoRosBag2RLDSConverter:
         episode_frames.clear()
         gc.collect()
 
-    def _reset_current_video_cache(self):
-        """Reset current camera images to empty PNG for a fresh episode start."""
-        self._cur_video_png = {
-            camera_key: self._empty_png_bytes
-            for camera_key in self.video_topics.keys()
-        }
-
     def _reset_message_caches(self):
         """Zero the state/action caches so a new episode cannot start with
         values left over from a previous episode or bag."""
@@ -336,6 +434,8 @@ class MultiVideoRosBag2RLDSConverter:
         self._cur_action_msg = np.zeros(STATE_ACTION_DIM, dtype=np.float32)
         self._cur_chassis_state_msg = np.zeros(CHASSIS_DIM, dtype=np.float32)
         self._cur_chassis_action_msg = np.zeros(CHASSIS_DIM, dtype=np.float32)
+        self._dirty_state.clear()
+        self._dirty_action.clear()
 
     def _make_camera_observation_feature(self, camera_key: str):
         """Store decoded camera image as PNG (224x224x3) for each step."""
@@ -602,94 +702,62 @@ class MultiVideoRosBag2RLDSConverter:
         elif topicName == self.chassis_action_topic:
             self._cur_chassis_action_msg[:] = chassis_data
 
-    def _update_video_frame(self, topicName: str, msg: FFMPEGPacket):
-        camera_key = self._get_camera_key_from_topic(topicName)
-        if not camera_key:
-            return
-
-        packet_bytes = bytes(msg.data)
-        if not packet_bytes:
-            return
-
-        decoder = self._video_decoders[camera_key]
-        try:
-            decoded_frames = decoder.decode(av.Packet(packet_bytes))
-        except Exception as e:
-            self._video_decode_error_counter[camera_key] += 1
-            err_cnt = self._video_decode_error_counter[camera_key]
-            if err_cnt <= 3:
-                self.logger.warning(
-                    'Decode failed for %s (%s) at pts=%s: %s',
-                    camera_key, topicName, getattr(msg, 'pts', -1), e
-                )
-            return
-
-        if not decoded_frames:
-            return
-
-        try:
-            # Use latest decoded frame.
-            frame_rgb = decoded_frames[-1].to_ndarray(format='rgb24')
-
-            # For head camera, split frame into left/right halves and keep the left half.
-            if camera_key == 'head_camera':
-                _, w, _ = frame_rgb.shape
-                if w >= 2:
-                    half_w = w // 2
-                    frame_rgb = frame_rgb[:, :half_w, :]
-                else:
-                    self.logger.warning(
-                        'Head camera frame width too small to split (w=%s), keeping original frame.',
-                        w
-                    )
-
-            # Resize to target resolution (224x224) via ffmpeg scaler.
-            resized = av.VideoFrame.from_ndarray(
-                np.ascontiguousarray(frame_rgb, dtype=np.uint8),
-                format='rgb24',
-            ).reformat(
-                width=self._target_image_w,
-                height=self._target_image_h,
-                format='rgb24',
-            )
-            frame_rgb_resized = np.ascontiguousarray(resized.to_ndarray(), dtype=np.uint8)
-            self._cur_video_png[camera_key] = tf.io.encode_png(frame_rgb_resized).numpy()
-        except Exception as e:
-            self._video_decode_error_counter[camera_key] += 1
-            err_cnt = self._video_decode_error_counter[camera_key]
-            if err_cnt <= 3:
-                self.logger.warning(
-                    'Resize/PNG encode failed for %s (%s) at pts=%s: %s',
-                    camera_key, topicName, getattr(msg, 'pts', -1), e
-                )
-        finally:
-            del decoded_frames
-
     def update_messages(self, topicName, data):
-        msg_type = self.topic_types_dict.get(topicName)
-        if not msg_type:
-            return
-        msg_class = get_message(msg_type)
-        msg = deserialize_message(data, msg_class)
+        """Update state/video/action caches from one message.
 
-        if topicName in self.state_topics_set:
-            self._update_state_msg(topicName, msg)
-        elif topicName in self.action_topics_set:
-            self._update_action_msg(topicName, msg)
-        elif topicName in self.chassis_topics_set:
-            self._update_chassis_msg(topicName, msg)
-        elif topicName in self.video_topics_set:
-            self._update_video_frame(topicName, msg)
+        Video packets are buffered raw (decode happens once per episode at
+        save time); state/action messages just cache their raw bytes — only
+        the latest message per topic matters, so deserialization is deferred
+        to the capture ticks (see _materialize_state/_materialize_action).
+        """
+        if topicName in self.video_topics_set:
+            msg_class = self.topic_msg_class.get(topicName)
+            if msg_class is None:
+                return
+            msg = deserialize_message(data, msg_class)
+            camera_key = self.topic_to_camera[topicName]
+            if camera_key not in self._video_dims:
+                self._video_dims[camera_key] = (int(msg.width), int(msg.height))
+            self._cur_video_packet = (camera_key, bytes(msg.data))
+
+        elif topicName in self.state_topics_set or topicName == self.chassis_state_topic:
+            if topicName in self.topic_msg_class:
+                self._dirty_state[topicName] = data
+
+        elif topicName in self.action_topics_set or topicName == self.chassis_action_topic:
+            if topicName in self.topic_msg_class:
+                self._dirty_action[topicName] = data
+
+    def _materialize_state(self):
+        """Apply the latest cached raw message of each state/chassis-state topic."""
+        if self._dirty_state:
+            for topic, raw in self._dirty_state.items():
+                msg = deserialize_message(raw, self.topic_msg_class[topic])
+                if topic == self.chassis_state_topic:
+                    self._update_chassis_msg(topic, msg)
+                else:
+                    self._update_state_msg(topic, msg)
+            self._dirty_state.clear()
+
+    def _materialize_action(self):
+        """Apply the latest cached raw message of each action/chassis-action topic."""
+        if self._dirty_action:
+            for topic, raw in self._dirty_action.items():
+                msg = deserialize_message(raw, self.topic_msg_class[topic])
+                if topic == self.chassis_action_topic:
+                    self._update_chassis_msg(topic, msg)
+                else:
+                    self._update_action_msg(topic, msg)
+            self._dirty_action.clear()
 
     def add_state_and_video_packet(self, frame_data: dict):
+        """Record current state into frame_data (PNGs are injected at save time)."""
+        self._materialize_state()
         frame_data['observation.state'] = self._cur_state_msg.copy()
         frame_data['observation.chassis_state'] = self._cur_chassis_state_msg.copy()
 
-        for camera_key, png_bytes in self._cur_video_png.items():
-            # Store compressed PNG bytes to reduce in-memory pressure.
-            frame_data[f'observation.{camera_key}'] = png_bytes
-
     def add_action(self, frame_data: dict):
+        self._materialize_action()
         frame_data['action'] = self._cur_action_msg.copy()
         frame_data['chassis_action'] = self._cur_chassis_action_msg.copy()
 
@@ -857,8 +925,19 @@ class MultiVideoRosBag2RLDSConverter:
         self._camera_info_cache = self._collect_camera_info(rosbag)
         self._reset_video_runtime_state()
 
-        non_recording_filter = StorageFilter(topics=['/xr/left_hand_inputs'])
-        reader.set_filter(non_recording_filter)
+        # Cache deserialization classes once per bag (get_message is not free
+        # at ~1M calls per bag)
+        self.topic_msg_class = {
+            t: get_message(ty) for t, ty in self.topic_types_dict.items()
+        }
+        self._dirty_state.clear()
+        self._dirty_action.clear()
+
+        # Read all consumed topics continuously: video packets must be
+        # buffered even between episodes so each X press can rewind to the
+        # last IDR keyframe (GOP != 1: starting mid-GOP is undecodable).
+        needed_topics = list(self.all_topics_set | {'/xr/left_hand_inputs'})
+        reader.set_filter(StorageFilter(topics=needed_topics))
 
         x_button, y_button = 2, 3
         is_recording = False
@@ -894,6 +973,15 @@ class MultiVideoRosBag2RLDSConverter:
 
             self.update_messages(topic, data)
 
+            # --- Maintain sliding window / episode buffer of raw video packets ---
+            camera_key = self.topic_to_camera.get(topic)
+            if camera_key is not None and self._cur_video_packet is not None:
+                pkt = {'data': self._cur_video_packet[1], 'ts': timestamp}
+                self._recent_packets[camera_key].append(pkt)
+                if is_recording and self._ep_packets is not None:
+                    self._ep_packets[camera_key].append(pkt)
+                self._cur_video_packet = None
+
             if topic == '/xr/left_hand_inputs':
                 try:
                     buttons = deserialize_message(data, Joy).buttons
@@ -902,7 +990,6 @@ class MultiVideoRosBag2RLDSConverter:
                         if previous_buttons is not None:
                             if (previous_buttons[x_button] == 0 and buttons[x_button] == 1 and not is_recording):
                                 is_recording = True
-                                reader.reset_filter()
                                 start_time = timestamp
                                 self.logger.info(f"Start #Episode marker pair: {self.num_xy_pairs}")
 
@@ -918,8 +1005,8 @@ class MultiVideoRosBag2RLDSConverter:
                                 frame_data.clear()
                                 self._clear_episode_frames(episode_frames)
                                 episode_frames = []
-                                self._reset_current_video_cache()
                                 self._reset_message_caches()
+                                self._start_episode_packets(start_time)
 
                             elif (previous_buttons[x_button] == 0 and buttons[x_button] == 1 and is_recording):
                                 is_recording = True
@@ -938,12 +1025,11 @@ class MultiVideoRosBag2RLDSConverter:
                                 frame_data.clear()
                                 self._clear_episode_frames(episode_frames)
                                 episode_frames = []
-                                self._reset_current_video_cache()
                                 self._reset_message_caches()
+                                self._start_episode_packets(start_time)
 
                             if (previous_buttons[y_button] == 0 and buttons[y_button] == 1 and is_recording):
                                 is_recording = False
-                                reader.set_filter(non_recording_filter)
                                 end_time = timestamp
                                 duration = end_time - start_time
                                 self.logger.info(
@@ -959,6 +1045,7 @@ class MultiVideoRosBag2RLDSConverter:
                                         f"max {episode_max_time_gap_s:.2f}s — data may contain hidden jumps"
                                     )
                                 if len(episode_frames) >= MIN_EPISODE_LENGTH:
+                                    self._inject_episode_images(episode_frames, start_time)
                                     save_ok = self.save_episode_rlds(
                                         episode_index=self.total_episodes_saved,
                                         episode_frames=episode_frames,
@@ -971,6 +1058,7 @@ class MultiVideoRosBag2RLDSConverter:
 
                                 self._clear_episode_frames(episode_frames)
                                 episode_frames = []
+                                self._ep_packets = None
                                 episode_state_target_t = None
                                 episode_action_target_t = None
 
@@ -988,6 +1076,11 @@ class MultiVideoRosBag2RLDSConverter:
 
                 elif episode_state_target_t <= timestamp <= episode_action_target_t and not is_in_adding_phase:
                     self.add_state_and_video_packet(frame_data)
+                    # Grid tick index of this row (tick 0 = start_time + 1/fps);
+                    # used to pick the matching video frame at save time
+                    frame_data['tick_index'] = int(round(
+                        (episode_state_target_t - start_time) * self.fps
+                    )) - 1
                     is_in_adding_phase = True
 
                 elif timestamp > episode_action_target_t and is_in_adding_phase:
