@@ -75,7 +75,7 @@ conda activate rosbag2lerobot
 
 ```bash
 # Fetch the modified lerobot (git submodule; or clone with --recurse-submodules)
-git submodule update --init lerobot
+GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --recursive --depth 1
 
 # Install modified lerobot version from the project (editable install required)
 cd lerobot
