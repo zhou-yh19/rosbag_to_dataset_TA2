@@ -114,7 +114,9 @@ except ImportError as e:
 STATE_ACTION_DIM = 62
 CHASSIS_DIM = 9   # 3 motors × (position + velocity + effort)
 MIN_EPISODE_LENGTH = 30
-ACTION_OFFSET_RATIO = 1.0 / 3.0
+# State->action capture offset in seconds (also the state-capture window
+# width). Must stay < 1/fps.
+ACTION_OFFSET_S = 1.0 / 90.0
 # Warn when consecutive sampled frames are this many frame periods apart in real
 # bag time (the synthetic step timestamps would silently hide the gap).
 TIME_GAP_WARN_RATIO = 3
@@ -995,7 +997,7 @@ class MultiVideoRosBag2RLDSConverter:
 
                                 episode_state_target_t = start_time + self.frame_duration
                                 episode_action_target_t = (
-                                    episode_state_target_t + ACTION_OFFSET_RATIO * self.frame_duration
+                                    episode_state_target_t + ACTION_OFFSET_S
                                 )
 
                                 is_in_adding_phase = False
@@ -1015,7 +1017,7 @@ class MultiVideoRosBag2RLDSConverter:
 
                                 episode_state_target_t = start_time + self.frame_duration
                                 episode_action_target_t = (
-                                    episode_state_target_t + ACTION_OFFSET_RATIO * self.frame_duration
+                                    episode_state_target_t + ACTION_OFFSET_S
                                 )
 
                                 is_in_adding_phase = False
@@ -1104,7 +1106,7 @@ class MultiVideoRosBag2RLDSConverter:
                     skipped_frames = time_gap // self.frame_duration
 
                     episode_state_target_t += (skipped_frames + 1) * self.frame_duration
-                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_RATIO * self.frame_duration
+                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
                     is_in_adding_phase = False
 
                 elif timestamp > episode_action_target_t and not is_in_adding_phase:
@@ -1112,7 +1114,7 @@ class MultiVideoRosBag2RLDSConverter:
                     skipped_frames = time_gap // self.frame_duration + 1
 
                     episode_state_target_t += skipped_frames * self.frame_duration
-                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_RATIO * self.frame_duration
+                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
                     frame_data.clear()
 
         if _bag_first_ts is not None and _bag_last_ts is not None:

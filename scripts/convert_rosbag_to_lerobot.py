@@ -132,7 +132,9 @@ except ImportError as e:
 # Constants
 STATE_ACTION_DIM = 72  # 62 base + 10 chassis/kinco (same indices for state & action)
 MIN_EPISODE_LENGTH = 30
-ACTION_OFFSET_RATIO = 1.0 / 3.0
+# State->action capture offset in seconds (also the state-capture window
+# width). Must stay < 1/fps.
+ACTION_OFFSET_S = 1.0 / 90.0
 
 
 # =============================================================================
@@ -1235,7 +1237,7 @@ class MultiVideoRosBag2LeRobotConverter:
                     idr_synced = True
                     start_time = timestamp
                     episode_state_target_t = start_time + self.frame_duration
-                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_RATIO * self.frame_duration
+                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
                     self.logger.info(
                         f"🔴 All cameras IDR-synced at {start_time:.3f}s. "
                         f"Starting state/action capture."
@@ -1268,7 +1270,7 @@ class MultiVideoRosBag2LeRobotConverter:
                     skipped_frames = time_gap // self.frame_duration
 
                     episode_state_target_t += (skipped_frames + 1) * self.frame_duration
-                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_RATIO * self.frame_duration
+                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
                     is_in_adding_phase = False
 
                 elif timestamp > episode_action_target_t and not is_in_adding_phase:
@@ -1276,7 +1278,7 @@ class MultiVideoRosBag2LeRobotConverter:
                     skipped_frames = time_gap // self.frame_duration + 1
 
                     episode_state_target_t += skipped_frames * self.frame_duration
-                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_RATIO * self.frame_duration
+                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
 
                     frame_data.clear()
 
@@ -1356,7 +1358,7 @@ class MultiVideoRosBag2LeRobotConverter:
                                 self.logger.info(f"🔴 Start #Episode: {self.num_xy_pairs}")
 
                                 episode_state_target_t = start_time + self.frame_duration
-                                episode_action_target_t = episode_state_target_t + ACTION_OFFSET_RATIO * self.frame_duration
+                                episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
 
                                 is_in_adding_phase = False
                                 frame_data.clear()
@@ -1368,7 +1370,7 @@ class MultiVideoRosBag2LeRobotConverter:
                                 self.logger.info(f"🔴 Re-record #Episode: {self.num_xy_pairs}")
 
                                 episode_state_target_t = start_time + self.frame_duration
-                                episode_action_target_t = episode_state_target_t + ACTION_OFFSET_RATIO * self.frame_duration
+                                episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
 
                                 self.dataset.clear_episode_buffer()
 
@@ -1428,7 +1430,7 @@ class MultiVideoRosBag2LeRobotConverter:
                     skipped_frames = time_gap // self.frame_duration
 
                     episode_state_target_t += (skipped_frames + 1) * self.frame_duration
-                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_RATIO * self.frame_duration
+                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
                     is_in_adding_phase = False
 
                 elif timestamp > episode_action_target_t and not is_in_adding_phase:
@@ -1436,7 +1438,7 @@ class MultiVideoRosBag2LeRobotConverter:
                     skipped_frames = time_gap // self.frame_duration + 1
 
                     episode_state_target_t += skipped_frames * self.frame_duration
-                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_RATIO * self.frame_duration
+                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
 
                     frame_data.clear()
 
