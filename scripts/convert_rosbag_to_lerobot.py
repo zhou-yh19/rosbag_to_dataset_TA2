@@ -313,6 +313,16 @@ class AllIdrVideoBuffer:
             pkt.time_base = time_base
             pkt.stream = stream
             container.mux(pkt)
+        # Sentinel: re-mux the last packet 1s past the end. The fps filter only
+        # emits a grid slot once it sees a frame beyond it, so without this the
+        # final tick can go unemitted when the last real frame lands just
+        # before it. The sentinel's own (re-decoded) picture is never output —
+        # it lies beyond the -frames:v cap.
+        sentinel = av.Packet(packet_list[-1]['data'])
+        sentinel.pts = sentinel.dts = last_pts + 90000
+        sentinel.time_base = time_base
+        sentinel.stream = stream
+        container.mux(sentinel)
         container.close()
         return ts_path
 
