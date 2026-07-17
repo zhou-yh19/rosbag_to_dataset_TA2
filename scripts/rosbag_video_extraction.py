@@ -191,6 +191,10 @@ def _build_extract_cmd(ts_path: str, first_tick_offset: float, fps: int,
         vf += "," + vf_post
     return head + [
         "-vf", vf,
+        # Pass filter output through 1:1 — without this, ffmpeg 7.x CFR-syncs
+        # the rawvideo pipe to its default 25fps and silently drops ~44% of
+        # the 45fps grid frames (4.4's default sync was already passthrough).
+        "-vsync", "passthrough",
         "-frames:v", str(n_grid),
         "-f", "rawvideo",
         "-pix_fmt", "bgr24",

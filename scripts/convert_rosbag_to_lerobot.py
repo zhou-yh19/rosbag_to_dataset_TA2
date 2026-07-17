@@ -331,7 +331,7 @@ class AllIdrVideoBuffer:
     def encode_episode(
         self, episode_index: int, dataset_meta,
         first_tick_time: float, episode_length: int, gpu_index: int = 0,
-        camera_resolutions: dict = None,
+        camera_resolutions: dict = None, tick_indices: list = None,
     ) -> dict:
         """
         Encode all buffered cameras to all-IDR MP4s, one concurrent ffmpeg each,
@@ -347,6 +347,9 @@ class AllIdrVideoBuffer:
             gpu_index: Which GPU to run decode+encode on
             camera_resolutions: {camera_name: (height, width, channels)} for
                 the stats sampler
+            tick_indices: Tick index of each data row when mid-episode ticks
+                were dropped (row j keeps grid slot tick_indices[j]); None
+                means no drops — rows map to contiguous grid slots 0..N-1
 
         Returns:
             {video_key: sampled_frames ndarray} for successfully sampled cameras
@@ -372,7 +375,7 @@ class AllIdrVideoBuffer:
             futures = [
                 cam_pool.submit(
                     self._encode_camera, camera_name, packet_list, tmp_path,
-                    first_tick_time, episode_length, gpu_index,
+                    first_tick_time, episode_length, gpu_index, tick_indices,
                 )
                 for camera_name, packet_list, tmp_path in jobs
             ]
@@ -411,7 +414,7 @@ class AllIdrVideoBuffer:
 
     def _encode_camera(
         self, camera_name, packet_list, tmp_path,
-        first_tick_time, episode_length, gpu_index,
+        first_tick_time, episode_length, gpu_index, tick_indices=None,
     ) -> None:
         """Mux one camera's packets and run its GPU (or fallback CPU) encode."""
         info = self.video_info[camera_name]
@@ -436,6 +439,9 @@ class AllIdrVideoBuffer:
             f"fps={self.fps}:start_time={grid_start:.6f}:round=up,"
             f"setpts=PTS-STARTPTS"
         )
+        # With dropped ticks the encode must cover the full tick span so
+        # _finalize_video can pick each row's own slot from the grid.
+        grid_span = (tick_indices[-1] + 1) if tick_indices else episode_length
 
         gpu_cmd = [
             "ffmpeg", "-y", "-v", "error",
@@ -445,7 +451,11 @@ class AllIdrVideoBuffer:
             "-c:v", "hevc_cuvid",
             "-i", ts_path,
             "-vf", resample_vf,
-            "-frames:v", str(episode_length),
+            # Ask for one extra frame: ffmpeg 7.x + NVENC can drop the frame
+            # that hits the -frames:v cap during teardown, so the capped
+            # frame must be a sacrificial one past the episode's last tick.
+            # _finalize_video trims the output back to episode_length.
+            "-frames:v", str(grid_span + 1),
             "-c:v", "hevc_nvenc",
             "-gpu", str(gpu_index),
             "-g", "1",
@@ -469,58 +479,76 @@ class AllIdrVideoBuffer:
                     f"  GPU pipeline failed for {camera_name} ({gpu_err}), "
                     f"falling back to CPU..."
                 )
-                self._encode_cpu(ts_path, tmp_path, resample_vf, episode_length)
+                self._encode_cpu(ts_path, tmp_path, resample_vf, grid_span)
         finally:
             if os.path.exists(ts_path):
                 os.unlink(ts_path)
 
-        self._pad_tail_frames(tmp_path, camera_name, episode_length)
+        self._finalize_video(tmp_path, camera_name, episode_length, tick_indices)
 
-    def _pad_tail_frames(self, tmp_path, camera_name, episode_length) -> None:
-        """Clone the final encoded packet until the video has episode_length frames.
+    def _finalize_video(self, tmp_path, camera_name, episode_length,
+                        tick_indices=None) -> None:
+        """Rebuild the container so it holds exactly episode_length frames.
 
-        A camera's last packet can precede the episode's final state tick (the
-        Y press lands between camera frames), leaving the CFR output 1 frame
-        short. Because the output is all-IDR, duplicating the last *encoded*
-        packet reproduces the exact same picture — a pure remux, no re-encode.
+        The encode requests episode_length+1 frames, so depending on the
+        ffmpeg version and tick phase the file arrives with N-1..N+1 real
+        packets — and ffmpeg 7.x's muxer writes nb_frames/duration from the
+        request, not from what it actually wrote, so the metadata cannot be
+        trusted (torchcodec then walks past EOF sampling the last frame).
+        A pure remux (no re-encode) keeps episode_length packets with
+        explicit uniform durations on a 90kHz timescale — the first
+        episode_length grid slots, or the rows' own slots when tick_indices
+        marks mid-episode drops; if the file is short, the final IDR packet
+        is cloned — all-IDR output makes the clone an exact picture
+        duplicate.
         """
-        with av.open(str(tmp_path)) as probe:
-            n_frames = probe.streams.video[0].frames
-        missing = episode_length - n_frames
-        if missing <= 0:
-            return
+        keep = set(tick_indices) if tick_indices else None
+        fixed_path = tmp_path.parent / (tmp_path.name + ".fix")
+        src = av.open(str(tmp_path))
+        dst = av.open(str(fixed_path), "w", format="mp4",
+                      options={"video_track_timescale": "90000"})
+        in_stream = src.streams.video[0]
+        out_stream = dst.add_stream_from_template(in_stream)
+        tb = Fraction(1, 90000)
+        step = int(round(90000 / self.fps))
+        grid_pos = 0
+        written = 0
+        last_data = None
+        for pkt in src.demux(in_stream):
+            if pkt.dts is None:
+                continue
+            if written >= episode_length:
+                break
+            if keep is not None and grid_pos not in keep:
+                grid_pos += 1
+                continue
+            grid_pos += 1
+            last_data = bytes(pkt)
+            pkt.pts = pkt.dts = written * step
+            pkt.duration = step
+            pkt.time_base = tb
+            pkt.stream = out_stream
+            dst.mux(pkt)
+            written += 1
+        missing = episode_length - written
         if missing > 5:
             logging.warning(
                 f"  {camera_name}: video is {missing} frames short of "
                 f"{episode_length} — camera dropout? Padding anyway."
             )
-
-        padded_path = tmp_path.parent / (tmp_path.name + ".pad")
-        src = av.open(str(tmp_path))
-        dst = av.open(str(padded_path), "w", format="mp4")
-        in_stream = src.streams.video[0]
-        out_stream = dst.add_stream_from_template(in_stream)
-        last = None
-        for pkt in src.demux(in_stream):
-            if pkt.dts is None:
-                continue
-            last = (bytes(pkt), pkt.pts, pkt.duration, pkt.time_base)
-            pkt.stream = out_stream
-            dst.mux(pkt)
-        data, last_pts, duration, time_base = last
-        step = duration or int(round(1 / (self.fps * time_base)))
-        for i in range(1, missing + 1):
-            pad = av.Packet(data)
-            pad.pts = pad.dts = last_pts + i * step
-            pad.duration = duration
-            pad.time_base = time_base
+        for i in range(written, episode_length):
+            pad = av.Packet(last_data)
+            pad.pts = pad.dts = i * step
+            pad.duration = step
+            pad.time_base = tb
             pad.stream = out_stream
             pad.is_keyframe = True
             dst.mux(pad)
         dst.close()
         src.close()
-        os.replace(padded_path, tmp_path)
-        logging.info(f"  {camera_name}: padded {missing} tail frame(s) by cloning the last IDR packet")
+        os.replace(fixed_path, tmp_path)
+        if missing > 0:
+            logging.info(f"  {camera_name}: padded {missing} tail frame(s) by cloning the last IDR packet")
 
     def _encode_cpu(self, ts_path, tmp_path, resample_vf, episode_length) -> None:
         """CPU fallback: software decode + libx265 all-IDR encode (same alignment)."""
@@ -528,7 +556,7 @@ class AllIdrVideoBuffer:
             "ffmpeg", "-y", "-v", "error",
             "-i", ts_path,
             "-vf", resample_vf,
-            "-frames:v", str(episode_length),
+            "-frames:v", str(episode_length + 1),
             "-c:v", "libx265",
             "-x265-params", "keyint=1:min-keyint=1:open-gop=0:log-level=error",
             "-preset", self.preset,
@@ -626,6 +654,7 @@ class MultiVideoRosBag2LeRobotConverter:
         )
         self._pending = deque()   # episodes submitted for encode, FIFO
         self._episode_seq = 0     # round-robin GPU assignment
+        self._episode_ticks = []  # tick index of each added row (holes = dropped ticks)
         self.max_pending = 2 * self._encode_workers
 
 
@@ -963,6 +992,7 @@ class MultiVideoRosBag2LeRobotConverter:
         IDR before the X press so ffmpeg can decode the complete GOP.
         """
         self.dataset.episode_buffer = self.dataset.create_episode_buffer()
+        self._episode_ticks = []
         packet_buffer = AllIdrVideoBuffer(
             root_dir=self.dataset.root, fps=self.dataset.fps, crf=self.crf
         )
@@ -1015,6 +1045,22 @@ class MultiVideoRosBag2LeRobotConverter:
 
         self.realign_timestamps()
 
+        # Row j's video frame must show row j's tick, so when mid-episode
+        # ticks were dropped the video grid has to skip the same slots the
+        # data rows skipped (row timestamps are realigned to a contiguous
+        # i/fps grid above, so any extra video slot would shift every later
+        # row onto an earlier frame). Identity (no drops) passes None.
+        tick_indices = self._episode_ticks
+        if len(tick_indices) != data_ep_len:
+            self.logger.error(
+                f"  tick tracker out of sync ({len(tick_indices)} ticks vs "
+                f"{data_ep_len} rows) — falling back to contiguous frames"
+            )
+            tick_indices = None
+        elif tick_indices[-1] == data_ep_len - 1:
+            tick_indices = None  # no dropped ticks — contiguous grid
+        self._episode_ticks = []
+
         # Detach the buffer: the main loop will create a fresh one at the next
         # X press, and _stage2_save reattaches this one when its encode is done.
         episode_buffer = self.dataset.episode_buffer
@@ -1040,6 +1086,7 @@ class MultiVideoRosBag2LeRobotConverter:
             episode_length=data_ep_len,
             gpu_index=gpu_index,
             camera_resolutions=camera_resolutions,
+            tick_indices=tick_indices,
         )
         self._pending.append({
             'future': future,
@@ -1236,6 +1283,7 @@ class MultiVideoRosBag2LeRobotConverter:
                 if not idr_synced and cameras_with_idr >= expected_cameras:
                     idr_synced = True
                     start_time = timestamp
+                    self._episode_ticks = []
                     episode_state_target_t = start_time + self.frame_duration
                     episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
                     self.logger.info(
@@ -1265,10 +1313,18 @@ class MultiVideoRosBag2LeRobotConverter:
                     self.dataset.add_frame(frame_data, task_description,
                                            episode_state_target_t - start_time - self.frame_duration)
                     frame_data.clear()
+                    self._episode_ticks.append(
+                        round((episode_state_target_t - start_time) / self.frame_duration) - 1)
 
                     time_gap = timestamp - episode_action_target_t
                     skipped_frames = time_gap // self.frame_duration
 
+                    if skipped_frames > 0:
+                        self.logger.warning(
+                            f"  ⚠️ {int(skipped_frames)} tick(s) lost to a "
+                            f"{time_gap * 1000:.0f}ms message gap at "
+                            f"t={episode_state_target_t - start_time:.3f}s in-episode"
+                        )
                     episode_state_target_t += (skipped_frames + 1) * self.frame_duration
                     episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
                     is_in_adding_phase = False
@@ -1277,6 +1333,11 @@ class MultiVideoRosBag2LeRobotConverter:
                     time_gap = timestamp - episode_action_target_t
                     skipped_frames = time_gap // self.frame_duration + 1
 
+                    self.logger.warning(
+                        f"  ⚠️ {int(skipped_frames)} tick(s) dropped: state window at "
+                        f"t={episode_state_target_t - start_time:.3f}s in-episode was "
+                        f"silent — row and video slot skipped together"
+                    )
                     episode_state_target_t += skipped_frames * self.frame_duration
                     episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
 
@@ -1425,10 +1486,18 @@ class MultiVideoRosBag2LeRobotConverter:
                     self.dataset.add_frame(frame_data, task_description,
                                            episode_state_target_t - start_time - self.frame_duration)
                     frame_data.clear()
+                    self._episode_ticks.append(
+                        round((episode_state_target_t - start_time) / self.frame_duration) - 1)
 
                     time_gap = timestamp - episode_action_target_t
                     skipped_frames = time_gap // self.frame_duration
 
+                    if skipped_frames > 0:
+                        self.logger.warning(
+                            f"  ⚠️ {int(skipped_frames)} tick(s) lost to a "
+                            f"{time_gap * 1000:.0f}ms message gap at "
+                            f"t={episode_state_target_t - start_time:.3f}s in-episode"
+                        )
                     episode_state_target_t += (skipped_frames + 1) * self.frame_duration
                     episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
                     is_in_adding_phase = False
@@ -1437,6 +1506,11 @@ class MultiVideoRosBag2LeRobotConverter:
                     time_gap = timestamp - episode_action_target_t
                     skipped_frames = time_gap // self.frame_duration + 1
 
+                    self.logger.warning(
+                        f"  ⚠️ {int(skipped_frames)} tick(s) dropped: state window at "
+                        f"t={episode_state_target_t - start_time:.3f}s in-episode was "
+                        f"silent — row and video slot skipped together"
+                    )
                     episode_state_target_t += skipped_frames * self.frame_duration
                     episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
 
