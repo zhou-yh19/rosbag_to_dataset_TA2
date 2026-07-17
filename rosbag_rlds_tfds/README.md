@@ -27,7 +27,7 @@ You can override any variable before `source`, for example:
 export ROSBAG_ROOT=/abs/path/to/rosbags
 export ROSBAG_MULTIBAG=1
 export ROSBAG_TASK="your task description"
-export ROSBAG_FPS=30
+export ROSBAG_FPS=45
 export ROSBAG_ENFORCE_VIDEO_TOPICS=0
 export ROSBAG_TFDS_N_WORKERS=4
 export ROSBAG_TFDS_MAX_PATHS_IN_MEMORY=8
@@ -40,7 +40,7 @@ source rosbag_rlds_tfds/setup_rosbag_rlds_env.sh
 - `ROSBAG_ROOT` default: `<repo>/data/rosbags` (via the setup script; the builder itself falls back to `./rosbag`)
 - `ROSBAG_MULTIBAG` default: `1`
 - `ROSBAG_TASK` default: `task description`
-- `ROSBAG_FPS` default: `30`
+- `ROSBAG_FPS` default: `45`
 - `ROSBAG_ENFORCE_VIDEO_TOPICS` default: `0`
 - `ROSBAG_TFDS_N_WORKERS` default: `4` (lower for memory safety)
 - `ROSBAG_TFDS_MAX_PATHS_IN_MEMORY` default: `8` (lower for memory safety)

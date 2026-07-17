@@ -132,7 +132,7 @@ rm -rf ~/.cache/huggingface/lerobot/username/dataset_name
 python scripts/convert_rosbag_to_lerobot.py \
   --input_directory ./data/rosbags/multiepisode_rosbag \
   --output username/dataset_name \
-  --fps 30 \
+  --fps 45 \
   --task "task description"
 ```
 
@@ -141,7 +141,7 @@ python scripts/convert_rosbag_to_lerobot.py \
 **Parameters**:
 - `--input_directory`: Directory containing ROS2 bag files (default: `./data/rosbags`)
 - `--output`, `-o`: Output dataset name (format: `username/dataset_name`)
-- `--fps`: Target frame rate (default: 30)
+- `--fps`: Target frame rate (default: 45)
 - `--task`: Task description
 - `--multibag`: (Optional) Use if the directory contains multiple rosbag folders
 - `--enforce_all_video_topics`: (Optional) Skip bags missing any of the three video topics
@@ -188,14 +188,14 @@ python scripts/convert_rosbag_to_hdf5.py \
   --multibag \
   --input_directory ./data/rosbags \
   --output_directory ./data/hdf5_output \
-  --fps 30 \
+  --fps 45 \
   --task "task description"
 ```
 
 **Parameters**:
 - `--input_directory`: Directory containing ROS2 bag files (default: `./data/rosbags`)
 - `--output_directory`, `-o`: Output directory for HDF5 episode files (default: `./data/hdf5_output`)
-- `--fps`: Target frame rate (default: 30)
+- `--fps`: Target frame rate (default: 45)
 - `--task`: Task description
 - `--multibag`: (Optional) Use if the directory contains multiple rosbag folders
 - `--enforce_all_video_topics`: (Optional) Skip bags missing any of the three video topics
@@ -268,7 +268,7 @@ Edit the `CFG_*` defaults in [setup_rosbag_rlds_env.sh](rosbag_rlds_tfds/setup_r
 - `CFG_ROSBAG_ROOT`: Rosbag file, single rosbag directory, or root directory containing multiple rosbag folders
 - `CFG_ROSBAG_MULTIBAG`: `1` to recursively discover multiple bags; `0` for one bag directory/file
 - `CFG_ROSBAG_TASK`: Language instruction stored in each RLDS step
-- `CFG_ROSBAG_FPS`: Target sampling rate (default: 30)
+- `CFG_ROSBAG_FPS`: Target sampling rate (default: 45)
 - `CFG_ROSBAG_ENFORCE_VIDEO_TOPICS`: `1` to skip bags missing required camera topics
 - `CFG_ROSBAG_TFDS_N_WORKERS` / `CFG_ROSBAG_TFDS_MAX_PATHS_IN_MEMORY`: Chunking of bag paths during generation; lower these for safer memory usage (generation itself currently runs single-threaded)
 - `CFG_ROSBAG_TFDS_DISABLE_SHUFFLING`: `1` (default) writes episodes in deterministic order
@@ -281,7 +281,7 @@ python scripts/convert_rosbag_to_rlds.py \
   --multibag \
   --input_directory ./data/rosbags \
   --output_directory ./data/rlds_output \
-  --fps 30 \
+  --fps 45 \
   --task "task description"
 ```
 

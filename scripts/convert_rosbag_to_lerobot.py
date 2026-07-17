@@ -40,7 +40,7 @@ Usage:
         --multibag \
         --input_directory ./data/rosbags \
         --output username/dataset_name \
-        --fps 30 \
+        --fps 45 \
         --task "task description"
     ```
 
@@ -50,7 +50,7 @@ Usage:
     python scripts/convert_rosbag_to_lerobot.py \
         --input_directory ./data/rosbags \
         --output username/dataset_name \
-        --fps 30 \
+        --fps 45 \
         --task "task description"
     ```
 
@@ -225,10 +225,10 @@ class AllIdrVideoBuffer:
 
     Example:
         ```python
-        buffer = AllIdrVideoBuffer(root_dir="dataset", fps=30)
+        buffer = AllIdrVideoBuffer(root_dir="dataset", fps=45)
         buffer.add_packet("left_color", pkt, width=2560, height=800, codec="hevc", ts=bag_t)
         buffer.encode_episode(episode_index=0, dataset_meta=meta,
-                              first_tick_time=start + 1/30, episode_length=900)
+                              first_tick_time=start + 1/45, episode_length=900)
         ```
     """
 
@@ -544,7 +544,7 @@ class AllIdrVideoBuffer:
 class MultiVideoRosBag2LeRobotConverter:
     """Enhanced converter for multiple ROS2 bags to single LeRobot dataset with multiple episodes."""
 
-    def __init__(self, input_directory: str, output_repo_id: str, fps: int = 30, crf: int = 23):
+    def __init__(self, input_directory: str, output_repo_id: str, fps: int = 45, crf: int = 23):
         self.input_directory = Path(input_directory)
         self.output_repo_id = output_repo_id
         self.fps = fps
@@ -1236,7 +1236,7 @@ class MultiVideoRosBag2LeRobotConverter:
                 if not idr_synced:
                     continue
 
-                # --- State/action frame sampling (30fps, same as old script) ---
+                # --- State/action frame sampling (fps grid, same as old script) ---
                 if timestamp < episode_state_target_t:
                     continue
 
@@ -1535,7 +1535,7 @@ def main():
                         default="output/dataset",
                         help="Output dataset repo ID")
     parser.add_argument("--fps", type=int,
-                        default=30,
+                        default=45,
                         help="Target FPS for dataset")
     parser.add_argument("--task",
                         default="task description",

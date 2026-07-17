@@ -40,7 +40,7 @@ Usage:
         --multibag \
         --input_directory ./data/rosbags \
         --output_directory ./data/rlds_output \
-        --fps 30 \
+        --fps 45 \
         --task "task description"
     ```
 
@@ -49,7 +49,7 @@ Usage:
     python scripts/convert_rosbag_to_rlds.py \
         --input_directory ./data/rosbags \
         --output_directory ./data/rlds_output \
-        --fps 30 \
+        --fps 45 \
         --task "task description"
     ```
 """
@@ -124,7 +124,7 @@ TARGET_IMAGE_SIZE = (224, 224)  # (height, width)
 class MultiVideoRosBag2RLDSConverter:
     """Enhanced converter for multiple ROS2 bags to RLDS-like TFRecord episodes."""
 
-    def __init__(self, input_directory: str, output_directory: str, fps: int = 30):
+    def __init__(self, input_directory: str, output_directory: str, fps: int = 45):
         self.input_directory = Path(input_directory)
         self.output_directory = Path(output_directory)
         self.fps = fps
@@ -1231,7 +1231,7 @@ def main():
                         help='Directory containing ROS2 bag segments')
     parser.add_argument('--output_directory', '-o', default='./data/rlds_output',
                         help='Output directory for RLDS episode files')
-    parser.add_argument('--fps', type=int, default=30, help='Target FPS for dataset')
+    parser.add_argument('--fps', type=int, default=45, help='Target FPS for dataset')
     parser.add_argument('--task', default='task description', help='Task description')
     parser.add_argument('--log_file', default=None,
                         help='Log file path (default: convert_rosbag_to_rlds_YYYYMMDD_HHMMSS.log in script directory)')

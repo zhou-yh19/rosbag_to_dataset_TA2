@@ -47,7 +47,7 @@ Usage:
         --multibag \
         --input_directory ./data/rosbags \
         --output_directory ./data/hdf5_output \
-        --fps 30 \
+        --fps 45 \
         --task "task description" \
         --start_episode_idx 0 \
         --jpeg_quality 85
@@ -58,7 +58,7 @@ Usage:
     python scripts/convert_rosbag_to_hdf5.py \
         --input_directory ./data/rosbags \
         --output_directory ./data/hdf5_output \
-        --fps 30 \
+        --fps 45 \
         --task "task description" \
         --start_episode_idx 88
 
@@ -126,7 +126,7 @@ class MultiVideoRosBag2HDF5Converter:
         self,
         input_directory: str,
         output_directory: str,
-        fps: int = 30,
+        fps: int = 45,
         start_episode_idx: int = 0,
         jpeg_quality: int = 85,
         jpeg_workers: int = 0,
@@ -1363,7 +1363,7 @@ def main():
                         default="./data/hdf5_output",
                         help="Output directory for HDF5 episode files")
     parser.add_argument("--fps", type=int,
-                        default=30,
+                        default=45,
                         help="Target FPS for dataset")
     parser.add_argument("--task",
                         default="task description",

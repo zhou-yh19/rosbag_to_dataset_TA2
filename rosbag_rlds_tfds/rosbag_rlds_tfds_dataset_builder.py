@@ -235,7 +235,7 @@ _EPISODE_IDX_COUNTER = itertools.count()
 def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
     """Yields episodes for list of rosbag files."""
     task_description = os.environ.get("ROSBAG_TASK", "task description")
-    fps = int(os.environ.get("ROSBAG_FPS", "30"))
+    fps = int(os.environ.get("ROSBAG_FPS", "45"))
     enforce_video_topics = _str2bool(
         os.environ.get("ROSBAG_ENFORCE_VIDEO_TOPICS", "0"),
         default=False,

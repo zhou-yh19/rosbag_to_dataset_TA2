@@ -17,14 +17,14 @@ Usage:
     python scripts/validate_rosbags.py \
         --input_directory ./data/rosbags \
         --task "叠衣服" \
-        --fps 30
+        --fps 45
 
     # Validate multiple rosbag directories
     python scripts/validate_rosbags.py \
         --multibag \
         --input_directory ./data/rosbags \
         --task "叠衣服" \
-        --fps 30
+        --fps 45
 """
 
 import os
@@ -249,7 +249,7 @@ def main():
                         help="Input directory contains multiple rosbag sub-directories")
     parser.add_argument("--input_directory", default="./data/rosbags",
                         help="Directory containing ROS2 bag(s)")
-    parser.add_argument("--fps", type=int, default=30,
+    parser.add_argument("--fps", type=int, default=45,
                         help="Target FPS (used to estimate frame counts)")
     parser.add_argument("--task", default="task description",
                         help="Task description")
