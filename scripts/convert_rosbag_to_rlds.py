@@ -330,9 +330,9 @@ class MultiVideoRosBag2RLDSConverter:
     def get_camera_resolution(self, camera_key):
         """Get camera resolution - different cameras may have different resolutions."""
         if camera_key == 'head_camera':
-            return (2160, 4320, 3)
+            return (1920, 3840, 3)
         else:
-            return (480, 848, 3)
+            return (800, 1280, 3)
 
     def _reset_video_runtime_state(self):
         """Reset packet-buffer runtime state to avoid cross-bag accumulation."""

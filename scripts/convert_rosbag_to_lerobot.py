@@ -721,9 +721,9 @@ class MultiVideoRosBag2LeRobotConverter:
         """Get camera resolution - different cameras may have different resolutions."""
         if camera_key == 'head_camera':
             # Head camera is higher resolution
-            return (2160, 4320, 3)
+            return (1920, 3840, 3)
         else:
-            return (480, 848, 3)  # Stereo cameras
+            return (800, 1280, 3)  # Stereo cameras
 
     def setup_features(self):
         """Setup LeRobot dataset features with 48-dim data + video features."""
