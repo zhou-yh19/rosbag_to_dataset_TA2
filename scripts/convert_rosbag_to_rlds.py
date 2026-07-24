@@ -332,7 +332,7 @@ class MultiVideoRosBag2RLDSConverter:
         if camera_key == 'head_camera':
             return (1920, 3840, 3)
         else:
-            return (800, 1280, 3)
+            return (800, 2560, 3)
 
     def _reset_video_runtime_state(self):
         """Reset packet-buffer runtime state to avoid cross-bag accumulation."""

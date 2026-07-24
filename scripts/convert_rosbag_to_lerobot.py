@@ -723,7 +723,7 @@ class MultiVideoRosBag2LeRobotConverter:
             # Head camera is higher resolution
             return (1920, 3840, 3)
         else:
-            return (800, 1280, 3)  # Stereo cameras
+            return (800, 2560, 3)  # Stereo cameras
 
     def setup_features(self):
         """Setup LeRobot dataset features with 48-dim data + video features."""

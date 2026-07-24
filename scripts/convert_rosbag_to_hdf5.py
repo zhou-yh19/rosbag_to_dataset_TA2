@@ -711,7 +711,7 @@ class MultiVideoRosBag2HDF5Converter:
             # Head camera is higher resolution
             return (1920, 3840, 3) 
         else:
-            return (800, 1280, 3)  # Stereo cameras
+            return (800, 2560, 3)  # Stereo cameras
 
     def setup_features(self):
         """Setup feature names for state/action dimensions."""
